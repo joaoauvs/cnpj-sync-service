@@ -1,0 +1,199 @@
+"""
+Central configuration for the RF CNPJ scraping pipeline.
+
+All tuneable constants live here so operators can adjust behaviour
+without touching business logic.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Final
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+ROOT_DIR: Final[Path] = Path(__file__).resolve().parent.parent
+DATA_DIR: Final[Path] = ROOT_DIR / "data"
+DOWNLOADS_DIR: Final[Path] = DATA_DIR / "downloads"
+EXTRACTED_DIR: Final[Path] = DATA_DIR / "extracted"
+PROCESSED_DIR: Final[Path] = DATA_DIR / "processed"
+LOGS_DIR: Final[Path] = ROOT_DIR / "logs"
+DUCKDB_PATH: Final[Path] = DATA_DIR / "cnpj.duckdb"
+
+for _d in (DOWNLOADS_DIR, EXTRACTED_DIR, PROCESSED_DIR, LOGS_DIR):
+    _d.mkdir(parents=True, exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# Storage backend
+# ---------------------------------------------------------------------------
+# Options: "parquet" (default), "csv", "duckdb"
+# parquet → data/processed/<name>.parquet  — recommended for most use cases
+# csv     → data/processed/<name>.csv      — universal but large and untyped
+# duckdb  → data/cnpj.duckdb              — single-file SQL database, great
+#                                            for local analytical queries
+STORAGE_BACKEND: Final[str] = "parquet"
+
+# ---------------------------------------------------------------------------
+# Remote source
+# ---------------------------------------------------------------------------
+
+BASE_URL: Final[str] = "https://dados-abertos-rf-cnpj.casadosdados.com.br/arquivos/"
+
+# ---------------------------------------------------------------------------
+# HTTP settings
+# ---------------------------------------------------------------------------
+
+REQUEST_TIMEOUT: Final[int] = 60          # seconds per request
+DOWNLOAD_CHUNK_SIZE: Final[int] = 8 * 1024 * 1024  # 8 MB streaming chunks
+MAX_RETRIES: Final[int] = 5
+BACKOFF_FACTOR: Final[float] = 2.0        # exponential back-off multiplier
+
+HEADERS: Final[dict[str, str]] = {
+    "User-Agent": (
+        "Mozilla/5.0 (compatible; RFCNPJScraper/1.0; "
+        "+https://github.com/yourorg/raspagem-empresas)"
+    ),
+    "Accept-Encoding": "gzip, deflate",
+}
+
+# ---------------------------------------------------------------------------
+# Concurrency
+# ---------------------------------------------------------------------------
+
+DOWNLOAD_WORKERS: Final[int] = 4    # parallel download threads
+PROCESS_WORKERS: Final[int] = 4     # parallel extraction/processing workers
+
+# ---------------------------------------------------------------------------
+# Processing
+# ---------------------------------------------------------------------------
+
+CSV_ENCODING: Final[str] = "latin-1"   # RF files use ISO-8859-1
+CSV_SEPARATOR: Final[str] = ";"
+CSV_CHUNK_ROWS: Final[int] = 200_000   # rows per pandas chunk (memory control)
+
+# ---------------------------------------------------------------------------
+# File group definitions
+# File groups that are partitioned (the server determines how many parts exist)
+# ---------------------------------------------------------------------------
+
+PARTITIONED_GROUPS: Final[tuple[str, ...]] = (
+    "Empresas",
+    "Estabelecimentos",
+    "Socios",
+)
+
+SINGLE_FILES: Final[tuple[str, ...]] = ("Simples",)
+
+REFERENCE_FILES: Final[tuple[str, ...]] = (
+    "Cnaes",
+    "Motivos",
+    "Municipios",
+    "Naturezas",
+    "Paises",
+    "Qualificacoes",
+)
+
+# ---------------------------------------------------------------------------
+# Column schemas (RF CNPJ public data — no headers in source files)
+# ---------------------------------------------------------------------------
+
+SCHEMAS: Final[dict[str, list[str]]] = {
+    "Empresas": [
+        "cnpj_basico",
+        "razao_social",
+        "natureza_juridica",
+        "qualificacao_responsavel",
+        "capital_social",
+        "porte_empresa",
+        "ente_federativo_responsavel",
+    ],
+    "Estabelecimentos": [
+        "cnpj_basico",
+        "cnpj_ordem",
+        "cnpj_dv",
+        "identificador_matriz_filial",
+        "nome_fantasia",
+        "situacao_cadastral",
+        "data_situacao_cadastral",
+        "motivo_situacao_cadastral",
+        "nome_cidade_exterior",
+        "pais",
+        "data_inicio_atividade",
+        "cnae_fiscal",
+        "cnae_fiscal_secundaria",
+        "tipo_logradouro",
+        "logradouro",
+        "numero",
+        "complemento",
+        "bairro",
+        "cep",
+        "uf",
+        "municipio",
+        "ddd_1",
+        "telefone_1",
+        "ddd_2",
+        "telefone_2",
+        "ddd_fax",
+        "fax",
+        "correio_eletronico",
+        "situacao_especial",
+        "data_situacao_especial",
+    ],
+    "Socios": [
+        "cnpj_basico",
+        "identificador_socio",
+        "nome_socio_razao_social",
+        "cnpj_cpf_socio",
+        "qualificacao_socio",
+        "data_entrada_sociedade",
+        "pais",
+        "representante_legal",
+        "nome_representante",
+        "qualificacao_representante_legal",
+        "faixa_etaria",
+    ],
+    "Simples": [
+        "cnpj_basico",
+        "opcao_pelo_simples",
+        "data_opcao_simples",
+        "data_exclusao_simples",
+        "opcao_mei",
+        "data_opcao_mei",
+        "data_exclusao_mei",
+    ],
+    "Cnaes": ["codigo", "descricao"],
+    "Motivos": ["codigo", "descricao"],
+    "Municipios": ["codigo", "descricao"],
+    "Naturezas": ["codigo", "descricao"],
+    "Paises": ["codigo", "descricao"],
+    "Qualificacoes": ["codigo", "descricao"],
+}
+
+# ---------------------------------------------------------------------------
+# Date columns that need normalisation (YYYYMMDD → YYYY-MM-DD)
+# ---------------------------------------------------------------------------
+
+DATE_COLUMNS: Final[dict[str, list[str]]] = {
+    "Estabelecimentos": [
+        "data_situacao_cadastral",
+        "data_inicio_atividade",
+        "data_situacao_especial",
+    ],
+    "Socios": ["data_entrada_sociedade"],
+    "Simples": [
+        "data_opcao_simples",
+        "data_exclusao_simples",
+        "data_opcao_mei",
+        "data_exclusao_mei",
+    ],
+}
+
+# ---------------------------------------------------------------------------
+# Numeric columns that use Brazilian decimal format (comma → dot)
+# ---------------------------------------------------------------------------
+
+DECIMAL_COLUMNS: Final[dict[str, list[str]]] = {
+    "Empresas": ["capital_social"],
+}

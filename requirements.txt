@@ -1,0 +1,11 @@
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=5.1.0
+tqdm>=4.66.0
+loguru>=0.7.0
+click>=8.1.0
+pandas>=2.2.0
+pyarrow>=15.0.0
+duckdb>=0.10.0
+pydantic>=2.6.0
+tenacity>=8.2.0
