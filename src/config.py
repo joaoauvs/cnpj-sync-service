@@ -20,20 +20,9 @@ DOWNLOADS_DIR: Final[Path] = DATA_DIR / "downloads"
 EXTRACTED_DIR: Final[Path] = DATA_DIR / "extracted"
 PROCESSED_DIR: Final[Path] = DATA_DIR / "processed"
 LOGS_DIR: Final[Path] = ROOT_DIR / "logs"
-DUCKDB_PATH: Final[Path] = DATA_DIR / "cnpj.duckdb"
 
 for _d in (DOWNLOADS_DIR, EXTRACTED_DIR, PROCESSED_DIR, LOGS_DIR):
     _d.mkdir(parents=True, exist_ok=True)
-
-# ---------------------------------------------------------------------------
-# Storage backend
-# ---------------------------------------------------------------------------
-# Options: "parquet" (default), "csv", "duckdb"
-# parquet → data/processed/<name>.parquet  — recommended for most use cases
-# csv     → data/processed/<name>.csv      — universal but large and untyped
-# duckdb  → data/cnpj.duckdb              — single-file SQL database, great
-#                                            for local analytical queries
-STORAGE_BACKEND: Final[str] = "parquet"
 
 # ---------------------------------------------------------------------------
 # Remote sources (primary and fallback)
@@ -44,9 +33,6 @@ PRIMARY_BASE_URL: Final[str] = "https://arquivos.receitafederal.gov.br/index.php
 
 # Fallback source: dados-abertos-rf-cnpj (mirror)
 FALLBACK_BASE_URL: Final[str] = "https://dados-abertos-rf-cnpj.casadosdados.com.br/arquivos/"
-
-# Current active base URL (will be set dynamically)
-BASE_URL: Final[str] = PRIMARY_BASE_URL
 
 # ---------------------------------------------------------------------------
 # HTTP settings
@@ -69,8 +55,8 @@ HEADERS: Final[dict[str, str]] = {
 # Concurrency
 # ---------------------------------------------------------------------------
 
-DOWNLOAD_WORKERS: Final[int] = 4    # parallel download threads
-PROCESS_WORKERS: Final[int] = 4     # parallel extraction/processing workers
+DOWNLOAD_WORKERS: Final[int] = 8    # parallel download threads
+PROCESS_WORKERS: Final[int] = 8     # parallel extraction/processing workers
 
 # ---------------------------------------------------------------------------
 # Processing
@@ -90,8 +76,6 @@ PARTITIONED_GROUPS: Final[tuple[str, ...]] = (
     "Estabelecimentos",
     "Socios",
 )
-
-SINGLE_FILES: Final[tuple[str, ...]] = ("Simples",)
 
 REFERENCE_FILES: Final[tuple[str, ...]] = (
     "Cnaes",

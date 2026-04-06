@@ -20,22 +20,16 @@ from typing import Optional
 
 import requests
 from bs4 import BeautifulSoup
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from src.config import (
-    PRIMARY_BASE_URL,
+    BACKOFF_FACTOR,
     FALLBACK_BASE_URL,
     HEADERS,
     MAX_RETRIES,
-    BACKOFF_FACTOR,
-    REFERENCE_FILES,
-    SINGLE_FILES,
     PARTITIONED_GROUPS,
+    PRIMARY_BASE_URL,
+    REFERENCE_FILES,
     REQUEST_TIMEOUT,
 )
 from src.logger import logger

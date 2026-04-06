@@ -9,7 +9,6 @@ Design choices
 * Date columns are normalised from 'YYYYMMDD' strings → 'YYYY-MM-DD'.
 * Brazilian decimal columns (comma separator) are converted to float.
 * Invalid rows are counted and optionally written to a separate reject file.
-* Output backend is pluggable: Parquet (default), CSV, or DuckDB.
 """
 
 from __future__ import annotations
@@ -28,12 +27,10 @@ from src.config import (
     DECIMAL_COLUMNS,
     PROCESSED_DIR,
     SCHEMAS,
-    STORAGE_BACKEND,
 )
 from src.logger import logger
 from src.models import ExtractionResult, FileStatus, ProcessingResult
-from src.storage import get_writer, output_extension
-
+from src.storage import get_writer
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -117,7 +114,6 @@ def process_csv(
     output_dir: Path = PROCESSED_DIR,
     chunk_size: int = CSV_CHUNK_ROWS,
     write_rejects: bool = True,
-    backend: str = STORAGE_BACKEND,
 ) -> ProcessingResult:
     """
     Read a raw RF CNPJ CSV and write a normalised output CSV.
@@ -160,14 +156,13 @@ def process_csv(
     decimal_cols = DECIMAL_COLUMNS.get(group, [])
 
     zip_stem = extraction_result.download_result.remote_file.stem
-    ext = output_extension(backend)
-    output_path = output_dir / f"{zip_stem}{ext}"
+    output_path = output_dir / f"{zip_stem}.csv"
     reject_path = output_dir / f"{zip_stem}_rejects.csv"
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Remove stale output from a previous incomplete run
-    if output_path.exists() and backend != "duckdb":
+    if output_path.exists():
         output_path.unlink()
     if reject_path.exists() and write_rejects:
         reject_path.unlink()
@@ -178,11 +173,11 @@ def process_csv(
     t0 = time.perf_counter()
 
     try:
-        with get_writer(backend, output_path, group) as writer:
+        with get_writer("csv", output_path, group) as writer:
             for csv_path in extraction_result.extracted_paths:
                 logger.info(
-                    "Processing {} → {} [{}]",
-                    csv_path.name, output_path.name, backend,
+                    "Processing {} → {}",
+                    csv_path.name, output_path.name,
                 )
 
                 reader = pd.read_csv(
@@ -241,8 +236,8 @@ def process_csv(
         rows_written = writer.rows_written
         elapsed = time.perf_counter() - t0
         logger.success(
-            "Processed {} [{}]: {:,} rows, {:,} invalid in {:.1f}s",
-            zip_stem, backend, rows_written, rows_invalid, elapsed,
+            "Processed {}: {:,} rows, {:,} invalid in {:.1f}s",
+            zip_stem, rows_written, rows_invalid, elapsed,
         )
         return ProcessingResult(
             extraction_result=extraction_result,

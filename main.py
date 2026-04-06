@@ -1,228 +1,188 @@
+#!/usr/bin/env python3
 """
-CLI entry point for the RF CNPJ scraping pipeline.
+Sincronização CNPJ com SQL Server — Script Principal
 
-Usage examples
---------------
-# Run the full pipeline (latest snapshot, all groups)
-python main.py run
+Fluxo:
+  1. Descobre a data do snapshot mais recente disponível na RF
+  2. Verifica se esse snapshot já foi processado (controle_sincronizacao)
+  3. Se não, baixa, extrai, processa e carrega no SQL Server
+  4. Registra resultado na tabela de controle
 
-# Download and process only reference tables
-python main.py run --reference-only
+Uso:
+    python main.py [--force] [--date YYYY-MM-DD] [--log-level DEBUG]
 
-# Process specific groups with more parallelism
-python main.py run --groups Empresas --groups Socios --download-workers 6
-
-# Force re-download and re-extract everything
-python main.py run --force
-
-# List all available snapshots
-python main.py list-snapshots
-
-# Show info about the latest snapshot without downloading
-python main.py info
+Variáveis de ambiente (.env):
+    DB_USERNAME / SQLSERVER_USERNAME
+    DB_PASSWORD / SQLSERVER_PASSWORD
+    DB_SERVER        (padrão: 72.60.4.227)
+    DB_DATABASE      (padrão: receita-federal)
 """
 
 from __future__ import annotations
 
-import click
+import argparse
+import os
+import sys
+import time
+from datetime import date, datetime
+from pathlib import Path
+from typing import Optional
 
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+from src.config import HEADERS
+from src.crawler import discover_latest_snapshot_with_fallback
+from src.database import CNPJDatabase
 from src.logger import logger, setup_logging
+from src.sync import CNPJSync
 
+# ---------------------------------------------------------------------------
+# Descoberta de snapshot
+# ---------------------------------------------------------------------------
 
-@click.group(invoke_without_command=True)
-@click.option(
-    "--log-level",
-    default="INFO",
-    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False),
-    show_default=True,
-    help="Minimum log level for console output.",
-)
-@click.pass_context
-def cli(ctx: click.Context, log_level: str) -> None:
-    """RF CNPJ data scraping pipeline."""
-    setup_logging(level=log_level.upper())
-    if ctx.invoked_subcommand is None:
-        click.echo(ctx.get_help())
+def get_latest_snapshot_date() -> Optional[date]:
+    """Consulta o site da RF e retorna a data do snapshot mais recente."""
+    try:
+        session = requests.Session()
+        session.headers.update(HEADERS)
+        snapshot = discover_latest_snapshot_with_fallback(session=session)
+        session.close()
+
+        if snapshot and snapshot.date:
+            dt = datetime.strptime(snapshot.date, "%Y-%m-%d").date()
+            logger.info("Snapshot mais recente disponível: {}", dt)
+            return dt
+
+        logger.error("Não foi possível determinar a data do snapshot")
+        return None
+    except Exception as e:
+        logger.error("Erro ao consultar snapshot: {}", e)
+        return None
 
 
 # ---------------------------------------------------------------------------
-# run
+# Entrypoint
 # ---------------------------------------------------------------------------
 
-@cli.command()
-@click.option(
-    "--groups",
-    "-g",
-    multiple=True,
-    help=(
-        "Restrict to these file groups. "
-        "Choices: Empresas, Estabelecimentos, Socios, Simples, "
-        "Cnaes, Motivos, Municipios, Naturezas, Paises, Qualificacoes. "
-        "Repeat for multiple groups. Default: all."
-    ),
-)
-@click.option(
-    "--reference-only",
-    is_flag=True,
-    default=False,
-    help="Only download and process the small reference/lookup tables.",
-)
-@click.option(
-    "--force",
-    is_flag=True,
-    default=False,
-    help="Re-download and re-extract even if files already exist locally.",
-)
-@click.option(
-    "--download-workers",
-    default=4,
-    show_default=True,
-    type=int,
-    help="Number of parallel download threads.",
-)
-@click.option(
-    "--process-workers",
-    default=4,
-    show_default=True,
-    type=int,
-    help="Number of parallel processing threads.",
-)
-@click.option(
-    "--snapshot",
-    default=None,
-    help="Target a specific snapshot date (YYYY-MM-DD). Default: latest.",
-)
-@click.option(
-    "--format",
-    "storage_format",
-    default=None,
-    type=click.Choice(["parquet", "csv", "duckdb"], case_sensitive=False),
-    help="Output storage format. Overrides config.STORAGE_BACKEND. Default: parquet.",
-)
-def run(
-    groups: tuple[str, ...],
-    reference_only: bool,
-    force: bool,
-    download_workers: int,
-    process_workers: int,
-    snapshot: str | None,
-    storage_format: str | None,
-) -> None:
-    """Run the full scraping pipeline."""
-    from src.pipeline import run_pipeline
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Sincronização CNPJ → SQL Server")
+    parser.add_argument("--force", action="store_true",
+                        help="Forçar sincronização mesmo se snapshot já processado")
+    parser.add_argument("--date", type=str, metavar="YYYY-MM-DD",
+                        help="Data específica do snapshot. Padrão: mais recente disponível")
+    parser.add_argument("--log-level", default="INFO",
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    parser.add_argument("--server",
+                        default=os.getenv("DB_SERVER", "72.60.4.227"))
+    parser.add_argument("--database",
+                        default=os.getenv("DB_DATABASE", "receita-federal"))
+    parser.add_argument("--username", default=None,
+                        help="Usuário SQL Server (padrão: variável DB_USERNAME)")
+    parser.add_argument("--password", default=None,
+                        help="Senha SQL Server (padrão: variável DB_PASSWORD)")
+    parser.add_argument("--workers", type=int, default=4,
+                        help="Número de workers para download e processamento (padrão: 4)")
 
-    run_pipeline(
-        groups=list(groups) if groups else None,
-        snapshot_date=snapshot,
-        force_download=force,
-        force_extract=force,
-        download_workers=download_workers,
-        process_workers=process_workers,
-        reference_only=reference_only,
-        storage_backend=storage_format,
+    args = parser.parse_args()
+    setup_logging(level=args.log_level)
+
+    _start = time.perf_counter()
+    logger.info("=== CNPJ SYNC SERVICE INICIADO ===")
+
+    # Conexão com o banco
+    try:
+        db = CNPJDatabase(
+            server=args.server,
+            database=args.database,
+            username=args.username,
+            password=args.password,
+        )
+        sync = CNPJSync(db_connection=db)
+    except Exception as e:
+        logger.error("Erro ao criar conexão com banco: {}", e)
+        sys.exit(1)
+
+    # Inicializar banco (cria se não existe)
+    logger.info("Verificando banco de dados...")
+    if not sync.initialize_database():
+        logger.error("Falha ao inicializar banco de dados")
+        sys.exit(1)
+
+    if not db.test_connection():
+        logger.error("Falha na conexão com o banco de dados")
+        sys.exit(1)
+
+    logger.info("Banco de dados pronto")
+
+    # Determinar data do snapshot alvo
+    if args.date:
+        try:
+            snapshot_date = datetime.strptime(args.date, "%Y-%m-%d").date()
+            logger.info("Usando snapshot especificado: {}", snapshot_date)
+        except ValueError:
+            logger.error("Data inválida: {}. Use formato YYYY-MM-DD", args.date)
+            sys.exit(1)
+    else:
+        snapshot_date = get_latest_snapshot_date()
+        if not snapshot_date:
+            logger.error("Não foi possível obter data do snapshot mais recente")
+            sys.exit(1)
+
+    # Verificar se precisa sincronizar (antes de baixar qualquer arquivo)
+    if not args.force:
+        needs, msg = sync.check_snapshot_needs_sync(snapshot_date)
+        if not needs:
+            logger.info("{} — encerrando sem ação", msg)
+            _elapsed = time.perf_counter() - _start
+            logger.info("=== CNPJ SYNC SERVICE ENCERRADO (SEM AÇÃO) — tempo total: {} ===",
+                        _fmt_elapsed(_elapsed))
+            sys.exit(0)
+
+    # Sincronizar
+    result = sync.sync_snapshot(
+        snapshot_date=snapshot_date,
+        groups=None,
+        force_download=args.force,
+        force_extract=args.force,
+        download_workers=args.workers,
+        process_workers=args.workers,
+        reference_only=False,
+        force=args.force,
     )
 
-
-# ---------------------------------------------------------------------------
-# info
-# ---------------------------------------------------------------------------
-
-@cli.command()
-def info() -> None:
-    """Show information about the latest available snapshot."""
-    import requests
-    from src.config import HEADERS
-    from src.crawler import discover_latest_snapshot_with_fallback
-
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    try:
-        snapshot = discover_latest_snapshot_with_fallback(session=session)
-    finally:
-        session.close()
-
-    click.echo(f"\nLatest snapshot : {snapshot.date}")
-    click.echo(f"URL             : {snapshot.url}")
-    click.echo(f"Files           : {len(snapshot.files)}")
-    total_gb = snapshot.total_size_bytes / 1_024**3
-    click.echo(f"Total size      : {total_gb:.1f} GB (compressed)\n")
-
-    groups: dict[str, list] = {}
-    for f in snapshot.files:
-        groups.setdefault(f.group, []).append(f)
-
-    click.echo(f"{'Group':<22} {'Files':>5}  {'Size':>10}")
-    click.echo("-" * 42)
-    for group, gfiles in sorted(groups.items()):
-        total = sum(f.size_bytes or 0 for f in gfiles)
-        size_str = f"{total / 1_024**2:.0f} MB" if total < 1_024**3 else f"{total / 1_024**3:.1f} GB"
-        click.echo(f"{group:<22} {len(gfiles):>5}  {size_str:>10}")
-    click.echo()
+    _elapsed = time.perf_counter() - _start
+    if result.get("success"):
+        logger.info(
+            "=== SINCRONIZAÇÃO CONCLUÍDA: {}/{} arquivos, {:,} registros — tempo total: {} ===",
+            result.get("successful_files", 0),
+            result.get("total_files", 0),
+            result.get("total_records", 0),
+            _fmt_elapsed(_elapsed),
+        )
+        sys.exit(0)
+    else:
+        logger.error("=== SINCRONIZAÇÃO FALHOU: {} — tempo total: {} ===",
+                     result.get("message", ""), _fmt_elapsed(_elapsed))
+        sys.exit(1)
 
 
-# ---------------------------------------------------------------------------
-# list-snapshots
-# ---------------------------------------------------------------------------
-
-@cli.command("list-snapshots")
-def list_snapshots() -> None:
-    """List all available snapshot dates on the server."""
-    import requests
-    from src.config import HEADERS
-    from src.crawler import list_all_snapshots_with_fallback
-
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    try:
-        dates = list_all_snapshots_with_fallback(session=session)
-    finally:
-        session.close()
-
-    click.echo(f"\n{len(dates)} snapshots available:\n")
-    for d in dates:
-        click.echo(f"  {d}")
-    click.echo()
-
-
-# ---------------------------------------------------------------------------
-# download-only
-# ---------------------------------------------------------------------------
-
-@cli.command("download-only")
-@click.option("--groups", "-g", multiple=True, help="File groups to download.")
-@click.option("--reference-only", is_flag=True, default=False)
-@click.option("--force", is_flag=True, default=False)
-@click.option("--workers", default=4, show_default=True, type=int)
-def download_only(
-    groups: tuple[str, ...],
-    reference_only: bool,
-    force: bool,
-    workers: int,
-) -> None:
-    """Download ZIP files without extraction or processing."""
-    import requests
-    from src.config import HEADERS, REFERENCE_FILES
-    from src.crawler import discover_latest_snapshot_with_fallback
-    from src.downloader import download_all
-
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    try:
-        snapshot = discover_latest_snapshot_with_fallback(session=session)
-        files = snapshot.files
-
-        if reference_only:
-            files = [f for f in files if f.group in REFERENCE_FILES]
-        elif groups:
-            groups_set = {g.lower() for g in groups}
-            files = [f for f in files if f.group.lower() in groups_set]
-
-        download_all(files, workers=workers, force=force)
-    finally:
-        session.close()
+def _fmt_elapsed(seconds: float) -> str:
+    """Formata segundos em string legível: '1h 23min 45s' ou '4min 30s' ou '45s'."""
+    total = int(seconds)
+    h = total // 3600
+    m = (total % 3600) // 60
+    s = total % 60
+    if h:
+        return f"{h}h {m:02d}min {s:02d}s"
+    if m:
+        return f"{m}min {s:02d}s"
+    return f"{s}s"
 
 
 if __name__ == "__main__":
-    import sys
-    # Allow running with no arguments (shows help) without raising SystemExit(2)
-    cli(standalone_mode=False, args=sys.argv[1:] or ["--help"])
+    main()

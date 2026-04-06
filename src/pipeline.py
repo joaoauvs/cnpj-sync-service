@@ -35,20 +35,11 @@ from src.config import (
     REFERENCE_FILES,
 )
 from src.crawler import discover_latest_snapshot_with_fallback
-from src.downloader import download_file, download_all
-from src.extractor import extract_zip, extract_all
+from src.downloader import download_file
+from src.extractor import extract_zip
 from src.logger import logger
-from src.models import (
-    DownloadResult,
-    ExtractionResult,
-    FileStatus,
-    PipelineRun,
-    ProcessingResult,
-    RemoteFile,
-    Snapshot,
-)
-from src.processor import process_csv, process_all
-
+from src.models import DownloadResult, ExtractionResult, FileStatus, PipelineRun, ProcessingResult, RemoteFile
+from src.processor import process_csv
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -60,13 +51,11 @@ def _file_pipeline(
     snapshot_date: str,
     force_download: bool = False,
     force_extract: bool = False,
-    storage_backend: Optional[str] = None,
 ) -> ProcessingResult:
     """Full pipeline for a single file: download → extract → process."""
-    from src.config import STORAGE_BACKEND
     dl = download_file(remote_file, session, DOWNLOADS_DIR, force=force_download)
     ex = extract_zip(dl, EXTRACTED_DIR, overwrite=force_extract)
-    pr = process_csv(ex, remote_file.group, PROCESSED_DIR, backend=storage_backend or STORAGE_BACKEND)
+    pr = process_csv(ex, remote_file.group, PROCESSED_DIR)
     return pr
 
 
@@ -82,7 +71,6 @@ def run_pipeline(
     download_workers: int = DOWNLOAD_WORKERS,
     process_workers: int = PROCESS_WORKERS,
     reference_only: bool = False,
-    storage_backend: Optional[str] = None,
 ) -> PipelineRun:
     """
     Execute the full scraping pipeline.
@@ -171,7 +159,6 @@ def run_pipeline(
             for rf in ref_files:
                 pr = _file_pipeline(
                     rf, session, snapshot.date, force_download, force_extract,
-                    storage_backend=storage_backend,
                 )
                 run.results.append(pr)
 
@@ -196,7 +183,6 @@ def run_pipeline(
                         snapshot.date,
                         force_download,
                         force_extract,
-                        storage_backend,
                     ): f
                     for f in main_files
                 }
