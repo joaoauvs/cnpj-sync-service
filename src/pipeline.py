@@ -34,7 +34,7 @@ from src.config import (
     PROCESSED_DIR,
     REFERENCE_FILES,
 )
-from src.crawler import discover_latest_snapshot
+from src.crawler import discover_latest_snapshot_with_fallback
 from src.downloader import download_file, download_all
 from src.extractor import extract_zip, extract_all
 from src.logger import logger
@@ -123,7 +123,7 @@ def run_pipeline(
         # 1. Discover snapshot
         # ------------------------------------------------------------------
         logger.info("=== PIPELINE START ===")
-        snapshot = discover_latest_snapshot(session=session)
+        snapshot = discover_latest_snapshot_with_fallback(session=session)
 
         if snapshot_date and snapshot.date != snapshot_date:
             logger.warning(

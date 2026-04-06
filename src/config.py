@@ -36,10 +36,17 @@ for _d in (DOWNLOADS_DIR, EXTRACTED_DIR, PROCESSED_DIR, LOGS_DIR):
 STORAGE_BACKEND: Final[str] = "parquet"
 
 # ---------------------------------------------------------------------------
-# Remote source
+# Remote sources (primary and fallback)
 # ---------------------------------------------------------------------------
 
-BASE_URL: Final[str] = "https://dados-abertos-rf-cnpj.casadosdados.com.br/arquivos/"
+# Primary source: Receita Federal official data
+PRIMARY_BASE_URL: Final[str] = "https://arquivos.receitafederal.gov.br/index.php/s/gn672Ad4CF8N6TK?dir=/Dados/Cadastros/CNPJ"
+
+# Fallback source: dados-abertos-rf-cnpj (mirror)
+FALLBACK_BASE_URL: Final[str] = "https://dados-abertos-rf-cnpj.casadosdados.com.br/arquivos/"
+
+# Current active base URL (will be set dynamically)
+BASE_URL: Final[str] = PRIMARY_BASE_URL
 
 # ---------------------------------------------------------------------------
 # HTTP settings

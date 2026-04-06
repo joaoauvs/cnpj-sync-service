@@ -132,12 +132,12 @@ def info() -> None:
     """Show information about the latest available snapshot."""
     import requests
     from src.config import HEADERS
-    from src.crawler import discover_latest_snapshot
+    from src.crawler import discover_latest_snapshot_with_fallback
 
     session = requests.Session()
     session.headers.update(HEADERS)
     try:
-        snapshot = discover_latest_snapshot(session=session)
+        snapshot = discover_latest_snapshot_with_fallback(session=session)
     finally:
         session.close()
 
@@ -169,12 +169,12 @@ def list_snapshots() -> None:
     """List all available snapshot dates on the server."""
     import requests
     from src.config import HEADERS
-    from src.crawler import list_all_snapshots
+    from src.crawler import list_all_snapshots_with_fallback
 
     session = requests.Session()
     session.headers.update(HEADERS)
     try:
-        dates = list_all_snapshots(session=session)
+        dates = list_all_snapshots_with_fallback(session=session)
     finally:
         session.close()
 
@@ -202,13 +202,13 @@ def download_only(
     """Download ZIP files without extraction or processing."""
     import requests
     from src.config import HEADERS, REFERENCE_FILES
-    from src.crawler import discover_latest_snapshot
+    from src.crawler import discover_latest_snapshot_with_fallback
     from src.downloader import download_all
 
     session = requests.Session()
     session.headers.update(HEADERS)
     try:
-        snapshot = discover_latest_snapshot(session=session)
+        snapshot = discover_latest_snapshot_with_fallback(session=session)
         files = snapshot.files
 
         if reference_only:

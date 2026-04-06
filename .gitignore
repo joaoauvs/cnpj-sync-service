@@ -141,4 +141,13 @@ dmypy.json
 # Cython debug symbols
 cython_debug/
 
+# Project-specific directories
+data/
+logs/
+*.html
+
+# Claude Code project files
+.claude/
+
+# Test directories
 /test
