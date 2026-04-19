@@ -8,6 +8,7 @@ Sinks configurados:
 
 from __future__ import annotations
 
+import os
 import sys
 import threading
 import uuid
@@ -119,6 +120,8 @@ def setup_enhanced_logging(
         return
     _setup_done = True
 
+    file_level = os.getenv("LOG_FILE_LEVEL", "INFO").upper()
+
     loguru_logger.remove()
 
     # Console — legível por humanos
@@ -136,7 +139,7 @@ def setup_enhanced_logging(
     # Arquivo — texto legível, rotation automática
     loguru_logger.add(
         str(log_dir / "pipeline.log"),
-        level="DEBUG",
+        level=file_level,
         format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{line} — {message}",
         rotation="100 MB",
         retention="30 days",

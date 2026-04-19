@@ -180,7 +180,7 @@ class CNPJPipeline:
                         continue
                     run.results.append(reused)
                     reused_count += 1
-                    logger.info(
+                    logger.debug(
                         "Reusing processed artifact for {} -> {}",
                         remote_file.name,
                         reused.output_path.name if reused.output_path else "",
@@ -323,7 +323,7 @@ def _save_run_report(run: PipelineRun) -> None:
             json.dumps(run.summary(), indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
-        logger.info("Run report saved: {}", report_path)
+        logger.debug("Run report saved: {}", report_path)
     except Exception as exc:
         logger.warning("Could not save run report: {}", exc)
 

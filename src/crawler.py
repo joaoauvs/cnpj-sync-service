@@ -116,7 +116,7 @@ def _latest_folder(session: requests.Session) -> str:
         raise RuntimeError(f"Nenhuma pasta YYYY-MM encontrada em {RF_WEBDAV_BASE}/")
 
     latest = sorted(pastas)[-1]
-    logger.info("Pastas disponíveis: {} — mais recente: {}", len(pastas), latest)
+    logger.debug("Pastas disponíveis: {} — mais recente: {}", len(pastas), latest)
     return latest
 
 
@@ -252,7 +252,7 @@ def _parse_snapshot_listing_html(html: str, snapshot_url: str) -> list[RemoteFil
 
 def _discover_html(session: requests.Session, base_url: str) -> Snapshot:
     """Descobre o snapshot mais recente via listagem HTML."""
-    logger.info("Buscando índice HTML: {}", base_url)
+    logger.debug("Buscando índice HTML: {}", base_url)
     html = _fetch_html(base_url, session)
     soup = BeautifulSoup(html, "lxml")
 
@@ -267,7 +267,7 @@ def _discover_html(session: requests.Session, base_url: str) -> Snapshot:
 
     latest = sorted(dated_dirs)[-1]
     snapshot_url = base_url.rstrip("/") + "/" + latest + "/"
-    logger.info("Snapshot mais recente: {}", latest)
+    logger.debug("Snapshot mais recente: {}", latest)
 
     snap_html = _fetch_html(snapshot_url, session)
     files = _parse_snapshot_listing_html(snap_html, snapshot_url)
@@ -302,7 +302,7 @@ class SnapshotCrawler:
         return session
 
     def discover_latest_snapshot(self, session: requests.Session) -> Snapshot:
-        logger.info("Fonte primária: WebDAV Receita Federal")
+        logger.debug("Fonte primária: WebDAV Receita Federal")
         return _discover_webdav(session)
 
     def discover_fallback_snapshot(self, session: requests.Session) -> Snapshot:

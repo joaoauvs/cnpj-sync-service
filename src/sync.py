@@ -254,7 +254,7 @@ class CNPJSync:
 
     def _load_reference(self, group: str, file_path: Path, snapshot_date: date) -> int:
         """Carrega tabela de referência (dimensão pequena) no banco."""
-        logger.info("Carregando referência {}: {}", group, file_path.name)
+        logger.debug("Carregando referência {}: {}", group, file_path.name)
         try:
             df = self._read_processed_file(file_path, group)
             df = self.normalizer.clean(df, group)
@@ -271,7 +271,7 @@ class CNPJSync:
 
     def _load_empresas(self, file_path: Path, snapshot_date: date) -> Tuple[int, int]:
         """Carrega empresas em chunks via bulk MERGE."""
-        logger.info("Carregando empresas: {}", file_path.name)
+        logger.debug("Carregando empresas: {}", file_path.name)
         total_inserted = total_updated = 0
         try:
             reader = self._read_processed_file(file_path, "Empresas", chunksize=self.chunk_size)
@@ -288,7 +288,7 @@ class CNPJSync:
 
     def _load_estabelecimentos(self, file_path: Path, snapshot_date: date) -> Tuple[int, int]:
         """Carrega estabelecimentos em chunks via bulk MERGE."""
-        logger.info("Carregando estabelecimentos: {}", file_path.name)
+        logger.debug("Carregando estabelecimentos: {}", file_path.name)
         total_inserted = total_updated = 0
         try:
             reader = self._read_processed_file(file_path, "Estabelecimentos", chunksize=self.chunk_size)
@@ -305,7 +305,7 @@ class CNPJSync:
 
     def _load_socios(self, file_path: Path, snapshot_date: date) -> int:
         """Carrega sócios em chunks (DELETE + INSERT por lote de cnpj_basico)."""
-        logger.info("Carregando socios: {}", file_path.name)
+        logger.debug("Carregando socios: {}", file_path.name)
         total = 0
         try:
             reader = self._read_processed_file(file_path, "Socios", chunksize=self.chunk_size)
@@ -321,7 +321,7 @@ class CNPJSync:
 
     def _load_simples(self, file_path: Path, snapshot_date: date) -> Tuple[int, int]:
         """Carrega Simples Nacional em chunks via bulk MERGE."""
-        logger.info("Carregando simples: {}", file_path.name)
+        logger.debug("Carregando simples: {}", file_path.name)
         total_inserted = total_updated = 0
         try:
             reader = self._read_processed_file(file_path, "Simples", chunksize=self.chunk_size)
@@ -523,13 +523,13 @@ class CNPJSync:
             target = base_dir / snap_str
             if target.exists():
                 shutil.rmtree(target, ignore_errors=True)
-                logger.info("Removido: {}", target)
+                logger.debug("Removido: {}", target)
 
         # Processed: remove arquivos carregados no DB
         processed_snap = PROCESSED_DIR / snap_str
         if processed_snap.exists():
             shutil.rmtree(processed_snap, ignore_errors=True)
-            logger.info("Removido: {}", processed_snap)
+            logger.debug("Removido: {}", processed_snap)
 
     # ------------------------------------------------------------------
     # Status (observabilidade)

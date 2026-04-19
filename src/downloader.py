@@ -201,7 +201,7 @@ class FileDownloader:
                     bytes_downloaded=dest.stat().st_size,
                 )
 
-            structured_logger.info(
+            structured_logger.debug(
                 "Downloading {} ({:.0f} MB)",
                 remote_file.name,
                 (remote_file.size_bytes or 0) / 1_024**2,
@@ -220,7 +220,7 @@ class FileDownloader:
                 raise ValueError(f"Downloaded file is empty: {remote_file.name}")
 
             speed = bytes_dl / elapsed / 1_024**2 if elapsed > 0 else 0
-            structured_logger.success(
+            structured_logger.debug(
                 "Downloaded {} in {:.1f}s ({:.1f} MB/s)",
                 remote_file.name,
                 elapsed,

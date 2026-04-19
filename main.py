@@ -73,6 +73,36 @@ def _fmt_elapsed(seconds: float) -> str:
     return f"{s}s"
 
 
+def _log_total_execution_time(result: dict, elapsed_seconds: float) -> int:
+    """Centraliza o log do tempo total e define o exit code da execução."""
+    elapsed = _fmt_elapsed(elapsed_seconds)
+
+    if result.get("success"):
+        logger.info(
+            "=== SINCRONIZAÇÃO CONCLUÍDA: {}/{} arquivos, {:,} registros — tempo total: {} ===",
+            result.get("successful_files", 0),
+            result.get("total_files", 0),
+            result.get("total_records", 0),
+            elapsed,
+        )
+        return 0
+
+    if result.get("skipped"):
+        logger.info(
+            "=== SEM AÇÃO: {} — tempo total: {} ===",
+            result.get("message", ""),
+            elapsed,
+        )
+        return 0
+
+    logger.error(
+        "=== SINCRONIZAÇÃO FALHOU: {} — tempo total: {} ===",
+        result.get("message", ""),
+        elapsed,
+    )
+    return 1
+
+
 class CNPJSyncApplication:
     """Aplicação principal orientada a objeto para o sync CNPJ."""
 
@@ -154,29 +184,7 @@ class CNPJSyncApplication:
         )
 
         elapsed = time.perf_counter() - start
-        if result.get("success"):
-            logger.info(
-                "=== SINCRONIZAÇÃO CONCLUÍDA: {}/{} arquivos, {:,} registros — tempo total: {} ===",
-                result.get("successful_files", 0),
-                result.get("total_files", 0),
-                result.get("total_records", 0),
-                _fmt_elapsed(elapsed),
-            )
-            return 0
-        if result.get("skipped"):
-            logger.info(
-                "=== SEM AÇÃO: {} — tempo total: {} ===",
-                result.get("message", ""),
-                _fmt_elapsed(elapsed),
-            )
-            return 0
-
-        logger.error(
-            "=== SINCRONIZAÇÃO FALHOU: {} — tempo total: {} ===",
-            result.get("message", ""),
-            _fmt_elapsed(elapsed),
-        )
-        return 1
+        return _log_total_execution_time(result, elapsed)
 
 
 def main() -> None:
