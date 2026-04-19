@@ -2,186 +2,185 @@
 """
 Sincronização CNPJ com SQL Server — Script Principal
 
-Fluxo:
-  1. Descobre a data do snapshot mais recente disponível na RF
-  2. Verifica se esse snapshot já foi processado (controle_sincronizacao)
-  3. Se não, baixa, extrai, processa e carrega no SQL Server
-  4. Registra resultado na tabela de controle
-
-Uso:
-    python main.py [--force] [--date YYYY-MM-DD] [--log-level DEBUG]
-
-Variáveis de ambiente (.env):
-    DB_USERNAME / SQLSERVER_USERNAME
-    DB_PASSWORD / SQLSERVER_PASSWORD
-    DB_SERVER        (padrão: 72.60.4.227)
-    DB_DATABASE      (padrão: receita-federal)
+Configuração via .env:
+    DB_SERVER        Endereço do SQL Server  (padrão: 72.60.4.227)
+    DB_DATABASE      Nome do banco           (padrão: receita-federal)
+    DB_USERNAME      Usuário SQL Server
+    DB_PASSWORD      Senha SQL Server
+    LOG_LEVEL        DEBUG | INFO | WARNING | ERROR  (padrão: INFO)
+    FORCE_SYNC       true | 1 — re-sincroniza mesmo que snapshot já processado
+    SNAPSHOT_DATE    YYYY-MM ou YYYY-MM-DD — data específica (padrão: mais recente)
 """
 
 from __future__ import annotations
 
-import argparse
 import os
+import shutil
 import sys
 import time
 from datetime import date, datetime
-from pathlib import Path
 from typing import Optional
 
-import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 
-sys.path.insert(0, str(Path(__file__).parent))
-
-from src.config import HEADERS
-from src.crawler import discover_latest_snapshot_with_fallback
+from src.config import DOWNLOAD_WORKERS, DOWNLOADS_DIR, EXTRACTED_DIR, PROCESS_WORKERS, PROCESSED_DIR
 from src.database import CNPJDatabase
-from src.logger import logger, setup_logging
+from src.logger_enhanced import logger, setup_enhanced_logging, structured_logger
 from src.sync import CNPJSync
 
-# ---------------------------------------------------------------------------
-# Descoberta de snapshot
-# ---------------------------------------------------------------------------
-
-def get_latest_snapshot_date() -> Optional[date]:
-    """Consulta o site da RF e retorna a data do snapshot mais recente."""
-    try:
-        session = requests.Session()
-        session.headers.update(HEADERS)
-        snapshot = discover_latest_snapshot_with_fallback(session=session)
-        session.close()
-
-        if snapshot and snapshot.date:
-            dt = datetime.strptime(snapshot.date, "%Y-%m-%d").date()
-            logger.info("Snapshot mais recente disponível: {}", dt)
-            return dt
-
-        logger.error("Não foi possível determinar a data do snapshot")
-        return None
-    except Exception as e:
-        logger.error("Erro ao consultar snapshot: {}", e)
-        return None
+_DB_SERVER     = os.getenv("DB_SERVER", "72.60.4.227")
+_DB_DATABASE   = os.getenv("DB_DATABASE", "receita-federal")
+_DB_USERNAME   = os.getenv("DB_USERNAME") or os.getenv("SQLSERVER_USERNAME")
+_DB_PASSWORD   = os.getenv("DB_PASSWORD") or os.getenv("SQLSERVER_PASSWORD")
+_LOG_LEVEL     = os.getenv("LOG_LEVEL", "INFO").upper()
+_FORCE         = os.getenv("FORCE_SYNC", "false").lower() in ("1", "true", "yes")
+_SNAPSHOT_DATE = os.getenv("SNAPSHOT_DATE")  # YYYY-MM ou YYYY-MM-DD, ou None
+_REUSE_PROCESSED = os.getenv("REUSE_PROCESSED", "true").lower() in ("1", "true", "yes")
 
 
-# ---------------------------------------------------------------------------
-# Entrypoint
-# ---------------------------------------------------------------------------
+def _clean_data_dir(reuse_processed: bool = False) -> None:
+    targets = [EXTRACTED_DIR]
+    if not reuse_processed:
+        targets.append(PROCESSED_DIR)
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Sincronização CNPJ → SQL Server")
-    parser.add_argument("--force", action="store_true",
-                        help="Forçar sincronização mesmo se snapshot já processado")
-    parser.add_argument("--date", type=str, metavar="YYYY-MM-DD",
-                        help="Data específica do snapshot. Padrão: mais recente disponível")
-    parser.add_argument("--log-level", default="INFO",
-                        choices=["DEBUG", "INFO", "WARNING", "ERROR"])
-    parser.add_argument("--server",
-                        default=os.getenv("DB_SERVER", "72.60.4.227"))
-    parser.add_argument("--database",
-                        default=os.getenv("DB_DATABASE", "receita-federal"))
-    parser.add_argument("--username", default=None,
-                        help="Usuário SQL Server (padrão: variável DB_USERNAME)")
-    parser.add_argument("--password", default=None,
-                        help="Senha SQL Server (padrão: variável DB_PASSWORD)")
-    parser.add_argument("--workers", type=int, default=4,
-                        help="Número de workers para download e processamento (padrão: 4)")
+    for d in targets:
+        if d.exists():
+            shutil.rmtree(d)
+        d.mkdir(parents=True, exist_ok=True)
 
-    args = parser.parse_args()
-    setup_logging(level=args.log_level)
+    if reuse_processed:
+        PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
-    _start = time.perf_counter()
-    logger.info("=== CNPJ SYNC SERVICE INICIADO ===")
 
-    # Conexão com o banco
-    try:
-        db = CNPJDatabase(
-            server=args.server,
-            database=args.database,
-            username=args.username,
-            password=args.password,
-        )
-        sync = CNPJSync(db_connection=db)
-    except Exception as e:
-        logger.error("Erro ao criar conexão com banco: {}", e)
-        sys.exit(1)
-
-    # Inicializar banco (cria se não existe)
-    logger.info("Verificando banco de dados...")
-    if not sync.initialize_database():
-        logger.error("Falha ao inicializar banco de dados")
-        sys.exit(1)
-
-    if not db.test_connection():
-        logger.error("Falha na conexão com o banco de dados")
-        sys.exit(1)
-
-    logger.info("Banco de dados pronto")
-
-    # Determinar data do snapshot alvo
-    if args.date:
-        try:
-            snapshot_date = datetime.strptime(args.date, "%Y-%m-%d").date()
-            logger.info("Usando snapshot especificado: {}", snapshot_date)
-        except ValueError:
-            logger.error("Data inválida: {}. Use formato YYYY-MM-DD", args.date)
-            sys.exit(1)
-    else:
-        snapshot_date = get_latest_snapshot_date()
-        if not snapshot_date:
-            logger.error("Não foi possível obter data do snapshot mais recente")
-            sys.exit(1)
-
-    # Verificar se precisa sincronizar (antes de baixar qualquer arquivo)
-    if not args.force:
-        needs, msg = sync.check_snapshot_needs_sync(snapshot_date)
-        if not needs:
-            logger.info("{} — encerrando sem ação", msg)
-            _elapsed = time.perf_counter() - _start
-            logger.info("=== CNPJ SYNC SERVICE ENCERRADO (SEM AÇÃO) — tempo total: {} ===",
-                        _fmt_elapsed(_elapsed))
-            sys.exit(0)
-
-    # Sincronizar
-    result = sync.sync_snapshot(
-        snapshot_date=snapshot_date,
-        groups=None,
-        force_download=args.force,
-        force_extract=args.force,
-        download_workers=args.workers,
-        process_workers=args.workers,
-        reference_only=False,
-        force=args.force,
-    )
-
-    _elapsed = time.perf_counter() - _start
-    if result.get("success"):
-        logger.info(
-            "=== SINCRONIZAÇÃO CONCLUÍDA: {}/{} arquivos, {:,} registros — tempo total: {} ===",
-            result.get("successful_files", 0),
-            result.get("total_files", 0),
-            result.get("total_records", 0),
-            _fmt_elapsed(_elapsed),
-        )
-        sys.exit(0)
-    else:
-        logger.error("=== SINCRONIZAÇÃO FALHOU: {} — tempo total: {} ===",
-                     result.get("message", ""), _fmt_elapsed(_elapsed))
-        sys.exit(1)
+def _parse_snapshot_date(raw: str) -> date:
+    """Aceita YYYY-MM (→ primeiro dia do mês) e YYYY-MM-DD."""
+    if len(raw) == 7:
+        return datetime.strptime(raw + "-01", "%Y-%m-%d").date()
+    return datetime.strptime(raw, "%Y-%m-%d").date()
 
 
 def _fmt_elapsed(seconds: float) -> str:
-    """Formata segundos em string legível: '1h 23min 45s' ou '4min 30s' ou '45s'."""
     total = int(seconds)
-    h = total // 3600
-    m = (total % 3600) // 60
-    s = total % 60
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
     if h:
         return f"{h}h {m:02d}min {s:02d}s"
     if m:
         return f"{m}min {s:02d}s"
     return f"{s}s"
+
+
+class CNPJSyncApplication:
+    """Aplicação principal orientada a objeto para o sync CNPJ."""
+
+    def __init__(
+        self,
+        server: str = _DB_SERVER,
+        database: str = _DB_DATABASE,
+        username: Optional[str] = _DB_USERNAME,
+        password: Optional[str] = _DB_PASSWORD,
+        log_level: str = _LOG_LEVEL,
+        force: bool = _FORCE,
+        snapshot_date_raw: Optional[str] = _SNAPSHOT_DATE,
+        reuse_processed_env: bool = _REUSE_PROCESSED,
+    ) -> None:
+        self.server = server
+        self.database = database
+        self.username = username
+        self.password = password
+        self.log_level = log_level
+        self.force = force
+        self.snapshot_date_raw = snapshot_date_raw
+        self.reuse_processed = reuse_processed_env and not force
+
+    def create_database(self) -> CNPJDatabase:
+        return CNPJDatabase(
+            server=self.server,
+            database=self.database,
+            username=self.username,
+            password=self.password,
+        )
+
+    def create_sync(self, db: CNPJDatabase) -> CNPJSync:
+        return CNPJSync(db_connection=db)
+
+    def resolve_snapshot_date(self) -> Optional[date]:
+        if not self.snapshot_date_raw:
+            return None
+        return _parse_snapshot_date(self.snapshot_date_raw)
+
+    def run(self) -> int:
+        setup_enhanced_logging(level=self.log_level)
+        start = time.perf_counter()
+        structured_logger.set_correlation_id()
+        _clean_data_dir(reuse_processed=self.reuse_processed)
+        logger.info("=== CNPJ SYNC SERVICE INICIADO ===")
+        logger.info("Reuse processed: {}", self.reuse_processed)
+
+        try:
+            db = self.create_database()
+            sync = self.create_sync(db)
+        except Exception as exc:
+            logger.error("Erro ao criar conexão com banco: {}", exc)
+            return 1
+
+        if not sync.initialize_database():
+            logger.error("Falha ao inicializar banco de dados")
+            return 1
+
+        if not db.test_connection():
+            logger.error("Falha na conexão com o banco de dados")
+            return 1
+
+        try:
+            snapshot_date = self.resolve_snapshot_date()
+        except ValueError:
+            logger.error("SNAPSHOT_DATE inválido: '{}'. Use YYYY-MM ou YYYY-MM-DD", self.snapshot_date_raw)
+            return 1
+
+        result = sync.sync_snapshot(
+            snapshot_date=snapshot_date,
+            groups=None,
+            force_download=self.force,
+            force_extract=self.force,
+            download_workers=DOWNLOAD_WORKERS,
+            process_workers=PROCESS_WORKERS,
+            reference_only=False,
+            force=self.force,
+            reuse_processed=self.reuse_processed,
+        )
+
+        elapsed = time.perf_counter() - start
+        if result.get("success"):
+            logger.info(
+                "=== SINCRONIZAÇÃO CONCLUÍDA: {}/{} arquivos, {:,} registros — tempo total: {} ===",
+                result.get("successful_files", 0),
+                result.get("total_files", 0),
+                result.get("total_records", 0),
+                _fmt_elapsed(elapsed),
+            )
+            return 0
+        if result.get("skipped"):
+            logger.info(
+                "=== SEM AÇÃO: {} — tempo total: {} ===",
+                result.get("message", ""),
+                _fmt_elapsed(elapsed),
+            )
+            return 0
+
+        logger.error(
+            "=== SINCRONIZAÇÃO FALHOU: {} — tempo total: {} ===",
+            result.get("message", ""),
+            _fmt_elapsed(elapsed),
+        )
+        return 1
+
+
+def main() -> None:
+    sys.exit(CNPJSyncApplication().run())
 
 
 if __name__ == "__main__":

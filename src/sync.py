@@ -15,68 +15,117 @@ import shutil
 import time
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import pandas as pd
+import pyarrow.parquet as pq
 
-from src.config import CSV_CHUNK_ROWS, CSV_ENCODING, CSV_SEPARATOR, DATE_COLUMNS, DECIMAL_COLUMNS, SCHEMAS
+from src.config import CSV_CHUNK_ROWS, CSV_ENCODING, CSV_SEPARATOR, DATE_COLUMNS, DECIMAL_COLUMNS, HEADERS, RF_AUTH, SCHEMAS, STORAGE_BACKEND
+from src.crawler import SnapshotCrawler, discover_latest_snapshot_with_fallback
 from src.database import CNPJDatabase
-from src.logger import logger
-from src.models import RemoteFile
-from src.pipeline import run_pipeline
+from src.logger_enhanced import logger, structured_logger
+from src.models import RemoteFile, Snapshot
+from src.pipeline import CNPJPipeline, run_pipeline
 
-# ---------------------------------------------------------------------------
-# Normalização de datas (YYYYMMDD → YYYY-MM-DD)
-# ---------------------------------------------------------------------------
+class DataFrameNormalizer:
+    """Serviço de normalização aplicado antes da carga no banco."""
 
-def _norm_date(val: Any) -> Optional[str]:
-    if val is None:
-        return None
-    try:
-        if pd.isna(val):
+    @staticmethod
+    def _norm_date(val: Any) -> Optional[str]:
+        if val is None:
             return None
-    except (TypeError, ValueError):
-        pass
-    s = str(val).strip()
-    if not s:
+        try:
+            if pd.isna(val):
+                return None
+        except (TypeError, ValueError):
+            pass
+        s = str(val).strip()
+        if not s:
+            return None
+        if len(s) == 10 and s[4] == "-" and s[7] == "-":
+            try:
+                date.fromisoformat(s)
+                return s
+            except ValueError:
+                return None
+        s = s.zfill(8)
+        if len(s) == 8 and s.isdigit() and s != "00000000":
+            candidate = f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+            try:
+                date.fromisoformat(candidate)
+                return candidate
+            except ValueError:
+                return None
         return None
-    # Já normalizado pelo processador: YYYY-MM-DD
-    if len(s) == 10 and s[4] == "-" and s[7] == "-":
-        return s
-    # Formato bruto da RF: YYYYMMDD
-    s = s.zfill(8)
-    if len(s) == 8 and s.isdigit() and s != "00000000":
-        return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
-    return None
+
+    def apply_date_cols(self, df: pd.DataFrame, group: str) -> pd.DataFrame:
+        for col in DATE_COLUMNS.get(group, []):
+            if col in df.columns:
+                df[col] = df[col].apply(self._norm_date)
+        return df
+
+    def apply_decimal_cols(self, df: pd.DataFrame, group: str) -> pd.DataFrame:
+        for col in DECIMAL_COLUMNS.get(group, []):
+            if col in df.columns:
+                df[col] = (
+                    df[col].astype(str)
+                    .str.replace(",", ".", regex=False)
+                    .str.strip()
+                    .replace("", None)
+                    .pipe(pd.to_numeric, errors="coerce")
+                )
+        return df
+
+    def clean(self, df: pd.DataFrame, group: str) -> pd.DataFrame:
+        df = df.apply(lambda s: s.str.strip() if s.dtype == object else s)
+        df = self.apply_date_cols(df, group)
+        df = self.apply_decimal_cols(df, group)
+        df = df.replace({"": None, "nan": None, "None": None})
+        return df
 
 
-def _apply_date_cols(df: pd.DataFrame, group: str) -> pd.DataFrame:
-    for col in DATE_COLUMNS.get(group, []):
-        if col in df.columns:
-            df[col] = df[col].apply(_norm_date)
-    return df
+class ProcessedFileReader:
+    """Serviço de leitura dos artefatos processados em CSV ou Parquet."""
 
+    def __init__(self, storage_backend: str = STORAGE_BACKEND) -> None:
+        self.storage_backend = storage_backend.lower()
 
-def _apply_decimal_cols(df: pd.DataFrame, group: str) -> pd.DataFrame:
-    for col in DECIMAL_COLUMNS.get(group, []):
-        if col in df.columns:
-            df[col] = (
-                df[col].astype(str)
-                .str.replace(",", ".", regex=False)
-                .str.strip()
-                .replace("", None)
-                .pipe(pd.to_numeric, errors="coerce")
+    @staticmethod
+    def iter_processed_chunks(file_path: Path, chunksize: int) -> Iterator[pd.DataFrame]:
+        suffix = file_path.suffix.lower()
+        if suffix == ".csv":
+            yield from pd.read_csv(
+                file_path,
+                encoding="utf-8",
+                dtype=str,
+                chunksize=chunksize,
+                on_bad_lines="warn",
             )
-    return df
+            return
 
+        if suffix == ".parquet":
+            parquet_file = pq.ParquetFile(file_path)
+            for batch in parquet_file.iter_batches(batch_size=chunksize, use_threads=True):
+                yield batch.to_pandas()
+            return
 
-def _clean_df(df: pd.DataFrame, group: str) -> pd.DataFrame:
-    """Strip strings, normaliza datas e decimais, substitui strings vazias por None."""
-    df = df.apply(lambda s: s.str.strip() if s.dtype == object else s)
-    df = _apply_date_cols(df, group)
-    df = _apply_decimal_cols(df, group)
-    df = df.replace({"": None, "nan": None, "None": None})
-    return df
+        raise ValueError(f"Formato de arquivo processado não suportado: {file_path.suffix}")
+
+    def read(self, file_path: Path, chunksize: Optional[int] = None):
+        if chunksize:
+            return self.iter_processed_chunks(file_path, chunksize)
+
+        if self.storage_backend == "csv":
+            return pd.read_csv(
+                file_path,
+                encoding="utf-8",
+                dtype=str,
+                chunksize=chunksize,
+                on_bad_lines="warn",
+            )
+        if self.storage_backend == "parquet":
+            return pd.read_parquet(file_path, engine="pyarrow")
+        raise ValueError(f"Backend de storage desconhecido: {self.storage_backend}")
 
 
 # ---------------------------------------------------------------------------
@@ -91,10 +140,18 @@ class CNPJSync:
         db_connection: CNPJDatabase,
         data_dir: Path = Path("data"),
         chunk_size: int = CSV_CHUNK_ROWS,
+        pipeline: Optional[CNPJPipeline] = None,
+        snapshot_crawler: Optional[SnapshotCrawler] = None,
+        file_reader: Optional[ProcessedFileReader] = None,
+        normalizer: Optional[DataFrameNormalizer] = None,
     ):
         self.db = db_connection
         self.data_dir = data_dir
         self.chunk_size = chunk_size
+        self.pipeline = pipeline or CNPJPipeline()
+        self.snapshot_crawler = snapshot_crawler or SnapshotCrawler()
+        self.file_reader = file_reader or ProcessedFileReader()
+        self.normalizer = normalizer or DataFrameNormalizer()
 
         self.downloads_dir = data_dir / "downloads"
         self.extracted_dir = data_dir / "extracted"
@@ -111,7 +168,6 @@ class CNPJSync:
     # ------------------------------------------------------------------
 
     def initialize_database(self) -> bool:
-        logger.info("Inicializando banco de dados...")
         if not self.db.create_database_if_not_exists():
             logger.error("Falha ao criar banco de dados")
             return False
@@ -123,7 +179,7 @@ class CNPJSync:
         if not self.db.execute_schema_script(script):
             logger.error("Falha ao executar schema.sql")
             return False
-        logger.info("Schema inicializado via schema.sql")
+        logger.debug("Schema inicializado via schema.sql")
         return True
 
     # ------------------------------------------------------------------
@@ -156,7 +212,6 @@ class CNPJSync:
         self.current_exec_id = exec_id
         self.current_snapshot_date = snapshot_date
         self.file_tracking.clear()
-        logger.info("Sessão iniciada: exec_id={}, snapshot={}", exec_id, snapshot_date)
         return True
 
     def _register_file(self, remote_file: RemoteFile) -> Optional[int]:
@@ -187,31 +242,22 @@ class CNPJSync:
     # Processadores por grupo
     # ------------------------------------------------------------------
 
-    def _read_processed_csv(self, csv_path: Path, group: str, chunksize: Optional[int] = None):
+    def _read_processed_file(self, file_path: Path, group: str, chunksize: Optional[int] = None):
         """
-        Lê um CSV processado pelo pipeline.
+        Lê um arquivo processado pelo pipeline (CSV ou Parquet).
 
-        O pipeline (CSVWriter) escreve CSVs com:
-          - separador vírgula (padrão pandas to_csv)
-          - encoding UTF-8
-          - cabeçalho na primeira linha
-
-        NÃO usar CSV_SEPARATOR nem CSV_ENCODING aqui.
+        O pipeline escreve arquivos com:
+          - CSV: separador vírgula, encoding UTF-8, cabeçalho na primeira linha
+          - Parquet: formato Apache Parquet com pyarrow
         """
-        return pd.read_csv(
-            csv_path,
-            encoding="utf-8",
-            dtype=str,
-            chunksize=chunksize,
-            on_bad_lines="warn",
-        )
+        return self.file_reader.read(file_path, chunksize=chunksize)
 
-    def _load_reference(self, group: str, csv_path: Path, snapshot_date: date) -> int:
+    def _load_reference(self, group: str, file_path: Path, snapshot_date: date) -> int:
         """Carrega tabela de referência (dimensão pequena) no banco."""
-        logger.info("Carregando referência {}: {}", group, csv_path.name)
+        logger.info("Carregando referência {}: {}", group, file_path.name)
         try:
-            df = self._read_processed_csv(csv_path, group)
-            df = _clean_df(df, group)
+            df = self._read_processed_file(file_path, group)
+            df = self.normalizer.clean(df, group)
             affected = self.db.bulk_upsert_reference(
                 table=group.lower(),
                 df=df,
@@ -223,14 +269,14 @@ class CNPJSync:
             logger.error("Erro ao carregar {}: {}", group, e)
             raise
 
-    def _load_empresas(self, csv_path: Path, snapshot_date: date) -> Tuple[int, int]:
+    def _load_empresas(self, file_path: Path, snapshot_date: date) -> Tuple[int, int]:
         """Carrega empresas em chunks via bulk MERGE."""
-        logger.info("Carregando empresas: {}", csv_path.name)
+        logger.info("Carregando empresas: {}", file_path.name)
         total_inserted = total_updated = 0
         try:
-            reader = self._read_processed_csv(csv_path, "Empresas", chunksize=self.chunk_size)
+            reader = self._read_processed_file(file_path, "Empresas", chunksize=self.chunk_size)
             for chunk in reader:
-                chunk = _clean_df(chunk, "Empresas")
+                chunk = self.normalizer.clean(chunk, "Empresas")
                 ins, upd = self.db.bulk_upsert_empresas(chunk, snapshot_date)
                 total_inserted += ins
                 total_updated += upd
@@ -240,14 +286,14 @@ class CNPJSync:
             logger.error("Erro ao carregar empresas: {}", e)
             raise
 
-    def _load_estabelecimentos(self, csv_path: Path, snapshot_date: date) -> Tuple[int, int]:
+    def _load_estabelecimentos(self, file_path: Path, snapshot_date: date) -> Tuple[int, int]:
         """Carrega estabelecimentos em chunks via bulk MERGE."""
-        logger.info("Carregando estabelecimentos: {}", csv_path.name)
+        logger.info("Carregando estabelecimentos: {}", file_path.name)
         total_inserted = total_updated = 0
         try:
-            reader = self._read_processed_csv(csv_path, "Estabelecimentos", chunksize=self.chunk_size)
+            reader = self._read_processed_file(file_path, "Estabelecimentos", chunksize=self.chunk_size)
             for chunk in reader:
-                chunk = _clean_df(chunk, "Estabelecimentos")
+                chunk = self.normalizer.clean(chunk, "Estabelecimentos")
                 ins, upd = self.db.bulk_upsert_estabelecimentos(chunk, snapshot_date)
                 total_inserted += ins
                 total_updated += upd
@@ -257,14 +303,14 @@ class CNPJSync:
             logger.error("Erro ao carregar estabelecimentos: {}", e)
             raise
 
-    def _load_socios(self, csv_path: Path, snapshot_date: date) -> int:
+    def _load_socios(self, file_path: Path, snapshot_date: date) -> int:
         """Carrega sócios em chunks (DELETE + INSERT por lote de cnpj_basico)."""
-        logger.info("Carregando socios: {}", csv_path.name)
+        logger.info("Carregando socios: {}", file_path.name)
         total = 0
         try:
-            reader = self._read_processed_csv(csv_path, "Socios", chunksize=self.chunk_size)
+            reader = self._read_processed_file(file_path, "Socios", chunksize=self.chunk_size)
             for chunk in reader:
-                chunk = _clean_df(chunk, "Socios")
+                chunk = self.normalizer.clean(chunk, "Socios")
                 n = self.db.bulk_insert_socios(chunk, snapshot_date)
                 total += n
             logger.info("Socios: {} inseridos", total)
@@ -273,14 +319,14 @@ class CNPJSync:
             logger.error("Erro ao carregar socios: {}", e)
             raise
 
-    def _load_simples(self, csv_path: Path, snapshot_date: date) -> Tuple[int, int]:
+    def _load_simples(self, file_path: Path, snapshot_date: date) -> Tuple[int, int]:
         """Carrega Simples Nacional em chunks via bulk MERGE."""
-        logger.info("Carregando simples: {}", csv_path.name)
+        logger.info("Carregando simples: {}", file_path.name)
         total_inserted = total_updated = 0
         try:
-            reader = self._read_processed_csv(csv_path, "Simples", chunksize=self.chunk_size)
+            reader = self._read_processed_file(file_path, "Simples", chunksize=self.chunk_size)
             for chunk in reader:
-                chunk = _clean_df(chunk, "Simples")
+                chunk = self.normalizer.clean(chunk, "Simples")
                 ins, upd = self.db.bulk_upsert_simples(chunk, snapshot_date)
                 total_inserted += ins
                 total_updated += upd
@@ -296,23 +342,23 @@ class CNPJSync:
 
     REFERENCE_GROUPS = {"Cnaes", "Motivos", "Municipios", "Naturezas", "Paises", "Qualificacoes"}
 
-    def _dispatch_group(self, group: str, csv_path: Path, snapshot_date: date) -> int:
+    def _dispatch_group(self, group: str, file_path: Path, snapshot_date: date) -> int:
         """
         Chama o loader correto para cada grupo.
         Retorna total de registros processados.
         """
         if group in self.REFERENCE_GROUPS:
-            return self._load_reference(group, csv_path, snapshot_date)
+            return self._load_reference(group, file_path, snapshot_date)
         if group == "Empresas":
-            ins, upd = self._load_empresas(csv_path, snapshot_date)
+            ins, upd = self._load_empresas(file_path, snapshot_date)
             return ins + upd
         if group == "Estabelecimentos":
-            ins, upd = self._load_estabelecimentos(csv_path, snapshot_date)
+            ins, upd = self._load_estabelecimentos(file_path, snapshot_date)
             return ins + upd
         if group == "Socios":
-            return self._load_socios(csv_path, snapshot_date)
+            return self._load_socios(file_path, snapshot_date)
         if group == "Simples":
-            ins, upd = self._load_simples(csv_path, snapshot_date)
+            ins, upd = self._load_simples(file_path, snapshot_date)
             return ins + upd
         logger.warning("Grupo desconhecido ignorado: {}", group)
         return 0
@@ -323,7 +369,7 @@ class CNPJSync:
 
     def sync_snapshot(
         self,
-        snapshot_date: date,
+        snapshot_date: Optional[date] = None,
         groups: Optional[List[str]] = None,
         force_download: bool = False,
         force_extract: bool = False,
@@ -331,28 +377,46 @@ class CNPJSync:
         process_workers: int = 4,
         reference_only: bool = False,
         force: bool = False,
+        reuse_processed: bool = False,
     ) -> Dict[str, Any]:
         """
         Sincroniza um snapshot completo.
 
         Fluxo:
-          1. Verifica se snapshot já foi processado (idempotência)
-          2. Registra início no controle_sincronizacao
-          3. Executa pipeline de download → extração → processamento CSV
-          4. Carrega CSVs no SQL Server via bulk MERGE
-          5. Atualiza controle_sincronizacao com resultado final
+          1. Descobre o snapshot (uma única chamada ao crawler)
+          2. Verifica idempotência
+          3. Download → extração → processamento
+          4. Carga no SQL Server via bulk MERGE
+          5. Atualiza controle_sincronizacao
           6. Remove arquivos temporários se sucesso
-
-        Retorna dict com métricas da execução.
         """
-        logger.info("=== INÍCIO SINCRONIZAÇÃO snapshot={} ===", snapshot_date)
+        import requests as _req
+        _session = self.snapshot_crawler.create_session()
+        _session.auth = RF_AUTH
+        try:
+            snapshot_obj: Snapshot = self.snapshot_crawler.discover_latest_snapshot_with_fallback(session=_session)
+        finally:
+            _session.close()
+
+        # Resolve data alvo: usa a do env/argumento ou a do snapshot descoberto
+        if snapshot_date is None:
+            raw = snapshot_obj.date
+            snapshot_date = datetime.strptime(raw + "-01", "%Y-%m-%d").date() if len(raw) == 7 \
+                else datetime.strptime(raw, "%Y-%m-%d").date()
+
+        logger.info("=== INÍCIO SINCRONIZAÇÃO snapshot={} ===", snapshot_obj.date)
+
+        # Verificação de idempotência
+        if not force:
+            needs, msg = self.check_snapshot_needs_sync(snapshot_date)
+            if not needs:
+                logger.info("{}", msg)
+                return {"success": True, "skipped": True, "message": msg, "snapshot_date": str(snapshot_date)}
 
         if not self.start_sync_session(snapshot_date, force=force):
-            already_done = self.db.check_snapshot_exists(snapshot_date)
             return {
-                "success": already_done,
-                "message": "Snapshot já processado — nenhuma ação necessária" if already_done
-                           else "Falha ao iniciar sessão de sincronização",
+                "success": False,
+                "message": "Falha ao iniciar sessão de sincronização",
                 "snapshot_date": str(snapshot_date),
             }
 
@@ -360,8 +424,8 @@ class CNPJSync:
         total_records = 0
 
         try:
-            # 1. Executar pipeline de download/extração/processamento CSV
-            pipeline_result = run_pipeline(
+            # 1. Executar pipeline com o snapshot já descoberto (sem nova chamada ao crawler)
+            pipeline_result = self.pipeline.run(
                 groups=groups,
                 snapshot_date=str(snapshot_date),
                 force_download=force_download,
@@ -369,11 +433,13 @@ class CNPJSync:
                 download_workers=download_workers,
                 process_workers=process_workers,
                 reference_only=reference_only,
+                snapshot=snapshot_obj,
+                reuse_processed=reuse_processed,
             )
 
             total_files = len(pipeline_result.results)
 
-            # 2. Carregar cada CSV no SQL Server
+            # 2. Carregar cada arquivo processado no SQL Server
             for pr in pipeline_result.results:
                 remote_file = pr.extraction_result.download_result.remote_file
                 filename = remote_file.name
@@ -459,7 +525,7 @@ class CNPJSync:
                 shutil.rmtree(target, ignore_errors=True)
                 logger.info("Removido: {}", target)
 
-        # Processed: remove CSVs carregados no DB
+        # Processed: remove arquivos carregados no DB
         processed_snap = PROCESSED_DIR / snap_str
         if processed_snap.exists():
             shutil.rmtree(processed_snap, ignore_errors=True)

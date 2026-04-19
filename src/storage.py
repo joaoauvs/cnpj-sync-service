@@ -1,15 +1,18 @@
 """
-Storage backend for pipeline output: CSV only.
+Storage backend for pipeline output: CSV and Parquet.
 """
 
 from __future__ import annotations
 
 import abc
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
-from src.logger import logger
+from src.logger_enhanced import logger
 
 # ---------------------------------------------------------------------------
 # Abstract base
@@ -88,16 +91,59 @@ class CSVWriter(StorageWriter):
 
 
 # ---------------------------------------------------------------------------
+# Parquet backend
+# ---------------------------------------------------------------------------
+
+class ParquetWriter(StorageWriter):
+    """Writes chunks incrementally to a single Parquet file (one row group per chunk).
+
+    Uses pyarrow.parquet.ParquetWriter directly so chunks are flushed to disk
+    as they arrive — no full-file accumulation in memory.
+    """
+
+    _pq_writer: Optional[pq.ParquetWriter] = None
+
+    def _open(self) -> None:
+        if self.path.exists():
+            self.path.unlink()
+        self._pq_writer = None
+        logger.debug("ParquetWriter: {}", self.path)
+
+    def write(self, chunk: pd.DataFrame) -> None:
+        table = pa.Table.from_pandas(chunk, preserve_index=False)
+        if self._pq_writer is None:
+            self._pq_writer = pq.ParquetWriter(self.path, table.schema)
+        self._pq_writer.write_table(table)
+        self._rows += len(chunk)
+
+    def _close(self) -> None:
+        if self._pq_writer is not None:
+            self._pq_writer.close()
+            self._pq_writer = None
+        logger.debug("ParquetWriter closed: {:,} rows → {}", self._rows, self.path.name)
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
 def get_writer(backend: str, path: Path, group: str) -> "StorageWriter":
-    """Return a StorageWriter. Currently only 'csv' is supported."""
-    if backend.lower() != "csv":
-        raise ValueError(f"Unknown storage backend '{backend}'. Only 'csv' is supported.")
-    return CSVWriter(path, group)
+    """Return a StorageWriter. Supports 'csv' and 'parquet'."""
+    backend_lower = backend.lower()
+    if backend_lower == "csv":
+        return CSVWriter(path, group)
+    elif backend_lower == "parquet":
+        return ParquetWriter(path, group)
+    else:
+        raise ValueError(f"Unknown storage backend '{backend}'. Supported: 'csv', 'parquet'.")
 
 
 def output_extension(backend: str) -> str:
     """Return the file extension for the given backend."""
-    return ".csv"
+    backend_lower = backend.lower()
+    if backend_lower == "csv":
+        return ".csv"
+    elif backend_lower == "parquet":
+        return ".parquet"
+    else:
+        raise ValueError(f"Unknown storage backend '{backend}'.")

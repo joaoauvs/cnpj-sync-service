@@ -14,6 +14,7 @@ Features
 from __future__ import annotations
 
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
@@ -28,15 +29,17 @@ from tenacity import (
 from tqdm import tqdm
 
 from src.config import (
+    BACKOFF_FACTOR,
     DOWNLOAD_CHUNK_SIZE,
     DOWNLOAD_WORKERS,
     DOWNLOADS_DIR,
     HEADERS,
     MAX_RETRIES,
-    BACKOFF_FACTOR,
+    RF_AUTH,
     REQUEST_TIMEOUT,
+    TOTAL_DOWNLOAD_WORKERS,
 )
-from src.logger import logger
+from src.logger_enhanced import logger, structured_logger
 from src.models import DownloadResult, FileStatus, RemoteFile
 
 
@@ -62,6 +65,24 @@ def _already_complete(path: Path, expected_bytes: Optional[int]) -> bool:
     actual = path.stat().st_size
     # Tolerate ±5% to account for rounded directory-listing sizes
     return abs(actual - expected_bytes) / max(expected_bytes, 1) <= 0.05
+
+
+def _valid_local_zip(path: Path) -> bool:
+    """
+    Return True if a local ZIP exists and passes an integrity check.
+
+    This lets us safely reuse already-downloaded files even when the remote
+    listing size is missing or rounded imprecisely.
+    """
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            if not zf.namelist():
+                return False
+            return zf.testzip() is None
+    except zipfile.BadZipFile:
+        return False
 
 
 @retry(
@@ -134,127 +155,120 @@ def _download_file(
     return bytes_written
 
 
-def download_file(
-    remote_file: RemoteFile,
-    session: Optional[requests.Session] = None,
-    dest_dir: Path = DOWNLOADS_DIR,
-    force: bool = False,
-) -> DownloadResult:
-    """
-    Download a single ``RemoteFile``.
+class FileDownloader:
+    """Serviço orientado a objeto para download e reaproveitamento de ZIPs."""
 
-    Parameters
-    ----------
-    remote_file:  File descriptor from the crawler.
-    session:      Optional shared session.  Created internally if None.
-    dest_dir:     Local directory to store the download.
-    force:        Re-download even if the file appears complete.
+    def __init__(
+        self,
+        dest_dir: Path = DOWNLOADS_DIR,
+        workers: int = TOTAL_DOWNLOAD_WORKERS,
+        default_headers: Optional[dict[str, str]] = None,
+        rf_auth: tuple[str, str] = RF_AUTH,
+    ) -> None:
+        self.dest_dir = dest_dir
+        self.workers = workers
+        self.default_headers = default_headers or HEADERS
+        self.rf_auth = rf_auth
 
-    Returns
-    -------
-    DownloadResult
-    """
-    dest = _local_path(remote_file, dest_dir)
-    own_session = session is None
-
-    if own_session:
+    def create_session(self) -> requests.Session:
         session = requests.Session()
-        session.headers.update(HEADERS)
+        session.headers.update(self.default_headers)
+        session.auth = self.rf_auth
+        return session
 
-    try:
-        if not force and _already_complete(dest, remote_file.size_bytes):
-            logger.info("SKIP {} (already complete)", remote_file.name)
+    def download_file(
+        self,
+        remote_file: RemoteFile,
+        session: Optional[requests.Session] = None,
+        force: bool = False,
+    ) -> DownloadResult:
+        dest = _local_path(remote_file, self.dest_dir)
+        own_session = session is None
+
+        if own_session:
+            session = self.create_session()
+
+        try:
+            if not force and (
+                _already_complete(dest, remote_file.size_bytes)
+                or _valid_local_zip(dest)
+            ):
+                logger.debug("SKIP {} (already downloaded locally)", remote_file.name)
+                return DownloadResult(
+                    remote_file=remote_file,
+                    local_path=dest,
+                    status=FileStatus.SKIPPED,
+                    bytes_downloaded=dest.stat().st_size,
+                )
+
+            structured_logger.info(
+                "Downloading {} ({:.0f} MB)",
+                remote_file.name,
+                (remote_file.size_bytes or 0) / 1_024**2,
+                operation="download",
+                file_name=remote_file.name,
+                file_size_mb=(remote_file.size_bytes or 0) / 1_024**2,
+                file_group=remote_file.group,
+            )
+            t0 = time.perf_counter()
+            bytes_dl = _download_file(remote_file, session, dest)
+            elapsed = time.perf_counter() - t0
+
+            actual = dest.stat().st_size
+            expected = remote_file.size_bytes
+            if expected and actual == 0:
+                raise ValueError(f"Downloaded file is empty: {remote_file.name}")
+
+            speed = bytes_dl / elapsed / 1_024**2 if elapsed > 0 else 0
+            structured_logger.success(
+                "Downloaded {} in {:.1f}s ({:.1f} MB/s)",
+                remote_file.name,
+                elapsed,
+                speed,
+                operation="download_complete",
+                file_name=remote_file.name,
+                duration_seconds=elapsed,
+                speed_mbps=speed,
+                bytes_downloaded=bytes_dl,
+            )
             return DownloadResult(
                 remote_file=remote_file,
                 local_path=dest,
-                status=FileStatus.SKIPPED,
-                bytes_downloaded=dest.stat().st_size,
+                status=FileStatus.DOWNLOADED,
+                bytes_downloaded=bytes_dl,
+                duration_seconds=elapsed,
             )
 
-        logger.info(
-            "Downloading {} ({:.0f} MB)",
-            remote_file.name,
-            (remote_file.size_bytes or 0) / 1_024**2,
-        )
-        t0 = time.perf_counter()
-        bytes_dl = _download_file(remote_file, session, dest)
-        elapsed = time.perf_counter() - t0
+        except Exception as exc:
+            logger.error("Failed to download {}: {}", remote_file.name, exc)
+            return DownloadResult(
+                remote_file=remote_file,
+                local_path=dest,
+                status=FileStatus.FAILED,
+                error=str(exc),
+            )
 
-        # Size is validated by the extractor's zipfile.testzip(); we only
-        # warn here since the directory-listing size is approximate.
-        actual = dest.stat().st_size
-        expected = remote_file.size_bytes
-        if expected and actual == 0:
-            raise ValueError(f"Downloaded file is empty: {remote_file.name}")
+        finally:
+            if own_session:
+                session.close()
 
-        speed = bytes_dl / elapsed / 1_024**2 if elapsed > 0 else 0
-        logger.success(
-            "Downloaded {} in {:.1f}s ({:.1f} MB/s)",
-            remote_file.name,
-            elapsed,
-            speed,
-        )
-        return DownloadResult(
-            remote_file=remote_file,
-            local_path=dest,
-            status=FileStatus.DOWNLOADED,
-            bytes_downloaded=bytes_dl,
-            duration_seconds=elapsed,
-        )
+    def download_all(
+        self,
+        files: list[RemoteFile],
+        force: bool = False,
+        workers: Optional[int] = None,
+    ) -> list[DownloadResult]:
+        if not files:
+            return []
 
-    except Exception as exc:
-        logger.error("Failed to download {}: {}", remote_file.name, exc)
-        return DownloadResult(
-            remote_file=remote_file,
-            local_path=dest,
-            status=FileStatus.FAILED,
-            error=str(exc),
-        )
+        worker_count = workers or self.workers
+        logger.info("Download: {} arquivos, {} workers", len(files), worker_count)
+        results: dict[int, DownloadResult] = {}
 
-    finally:
-        if own_session:
-            session.close()
-
-
-def download_all(
-    files: list[RemoteFile],
-    dest_dir: Path = DOWNLOADS_DIR,
-    workers: int = DOWNLOAD_WORKERS,
-    force: bool = False,
-) -> list[DownloadResult]:
-    """
-    Download a list of files in parallel.
-
-    Parameters
-    ----------
-    files:    Files to download.
-    dest_dir: Local destination directory.
-    workers:  Maximum concurrent downloads.
-    force:    Re-download already-complete files.
-
-    Returns
-    -------
-    list[DownloadResult]   One result per input file, in submission order.
-    """
-    if not files:
-        return []
-
-    logger.info(
-        "Starting parallel download: {} files, {} workers",
-        len(files),
-        workers,
-    )
-
-    session = requests.Session()
-    session.headers.update(HEADERS)
-
-    results: dict[int, DownloadResult] = {}
-
-    try:
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="dl") as pool:
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="dl") as pool:
             future_to_idx = {
-                pool.submit(download_file, f, session, dest_dir, force): i
-                for i, f in enumerate(files)
+                pool.submit(self.download_file, remote_file, None, force): idx
+                for idx, remote_file in enumerate(files)
             }
             for future in as_completed(future_to_idx):
                 idx = future_to_idx[future]
@@ -263,15 +277,41 @@ def download_all(
                 except Exception as exc:
                     results[idx] = DownloadResult(
                         remote_file=files[idx],
-                        local_path=_local_path(files[idx], dest_dir),
+                        local_path=_local_path(files[idx], self.dest_dir),
                         status=FileStatus.FAILED,
                         error=str(exc),
                     )
-    finally:
-        session.close()
 
-    ordered = [results[i] for i in range(len(files))]
-    n_ok = sum(1 for r in ordered if r.status in (FileStatus.DOWNLOADED, FileStatus.SKIPPED))
-    n_fail = sum(1 for r in ordered if r.status == FileStatus.FAILED)
-    logger.info("Downloads complete: {} ok, {} failed", n_ok, n_fail)
-    return ordered
+        ordered = [results[i] for i in range(len(files))]
+        n_skip = sum(1 for r in ordered if r.status == FileStatus.SKIPPED)
+        n_dl = sum(1 for r in ordered if r.status == FileStatus.DOWNLOADED)
+        n_fail = sum(1 for r in ordered if r.status == FileStatus.FAILED)
+        parts = []
+        if n_dl:
+            parts.append(f"{n_dl} baixados")
+        if n_skip:
+            parts.append(f"{n_skip} já existiam")
+        if n_fail:
+            parts.append(f"{n_fail} falhas")
+        logger.info("Download concluído: {}", ", ".join(parts))
+        return ordered
+
+
+def download_file(
+    remote_file: RemoteFile,
+    session: Optional[requests.Session] = None,
+    dest_dir: Path = DOWNLOADS_DIR,
+    force: bool = False,
+) -> DownloadResult:
+    """Compatibilidade pública com a API funcional anterior."""
+    return FileDownloader(dest_dir=dest_dir).download_file(remote_file, session=session, force=force)
+
+
+def download_all(
+    files: list[RemoteFile],
+    dest_dir: Path = DOWNLOADS_DIR,
+    workers: int = TOTAL_DOWNLOAD_WORKERS,
+    force: bool = False,
+) -> list[DownloadResult]:
+    """Compatibilidade pública com a API funcional anterior."""
+    return FileDownloader(dest_dir=dest_dir, workers=workers).download_all(files, force=force, workers=workers)

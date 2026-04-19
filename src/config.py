@@ -28,18 +28,23 @@ for _d in (DOWNLOADS_DIR, EXTRACTED_DIR, PROCESSED_DIR, LOGS_DIR):
 # Remote sources (primary and fallback)
 # ---------------------------------------------------------------------------
 
-# Primary source: Receita Federal official data
-PRIMARY_BASE_URL: Final[str] = "https://arquivos.receitafederal.gov.br/index.php/s/gn672Ad4CF8N6TK?dir=/Dados/Cadastros/CNPJ"
+# Receita Federal — WebDAV via Nextcloud (share público)
+RF_SHARE_TOKEN: Final[str] = "YggdBLfdninEJX9"
+RF_WEBDAV_BASE: Final[str] = "https://arquivos.receitafederal.gov.br/public.php/webdav"
+RF_AUTH: Final[tuple[str, str]] = (RF_SHARE_TOKEN, "")  # Basic Auth: (token, "")
 
-# Fallback source: dados-abertos-rf-cnpj (mirror)
+# Fallback source: mirror HTML (usado se WebDAV falhar)
 FALLBACK_BASE_URL: Final[str] = "https://dados-abertos-rf-cnpj.casadosdados.com.br/arquivos/"
+
+# Mantido para compatibilidade interna
+PRIMARY_BASE_URL: Final[str] = RF_WEBDAV_BASE
 
 # ---------------------------------------------------------------------------
 # HTTP settings
 # ---------------------------------------------------------------------------
 
-REQUEST_TIMEOUT: Final[int] = 60          # seconds per request
-DOWNLOAD_CHUNK_SIZE: Final[int] = 8 * 1024 * 1024  # 8 MB streaming chunks
+REQUEST_TIMEOUT: Final[int] = 120         # seconds per request
+DOWNLOAD_CHUNK_SIZE: Final[int] = 4 * 1024 * 1024  # 4 MB streaming chunks (melhor throughput)
 MAX_RETRIES: Final[int] = 5
 BACKOFF_FACTOR: Final[float] = 2.0        # exponential back-off multiplier
 
@@ -55,8 +60,15 @@ HEADERS: Final[dict[str, str]] = {
 # Concurrency
 # ---------------------------------------------------------------------------
 
-DOWNLOAD_WORKERS: Final[int] = 8    # parallel download threads
-PROCESS_WORKERS: Final[int] = 8     # parallel extraction/processing workers
+# Thread pool configuration for different operation types
+DOWNLOAD_WORKERS: Final[int] = 12          # parallel download threads (network-bound)
+EXTRACT_WORKERS: Final[int] = 4           # parallel extraction threads (CPU/disk-bound)
+PROCESS_WORKERS: Final[int] = 4           # parallel CSV processing threads (CPU-bound)
+DATABASE_WORKERS: Final[int] = 2          # parallel database load threads (I/O-bound)
+
+# Total workers for different pipeline stages
+TOTAL_DOWNLOAD_WORKERS: Final[int] = DOWNLOAD_WORKERS
+TOTAL_PROCESS_WORKERS: Final[int] = max(EXTRACT_WORKERS, PROCESS_WORKERS)  # whichever is bottleneck
 
 # ---------------------------------------------------------------------------
 # Processing
@@ -65,6 +77,9 @@ PROCESS_WORKERS: Final[int] = 8     # parallel extraction/processing workers
 CSV_ENCODING: Final[str] = "latin-1"   # RF files use ISO-8859-1
 CSV_SEPARATOR: Final[str] = ";"
 CSV_CHUNK_ROWS: Final[int] = 200_000   # rows per pandas chunk (memory control)
+
+# Storage backend configuration
+STORAGE_BACKEND: Final[str] = "parquet"  # Options: "csv" or "parquet"
 
 # ---------------------------------------------------------------------------
 # File group definitions

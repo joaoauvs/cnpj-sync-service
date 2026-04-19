@@ -1,37 +1,79 @@
 # CNPJ Sync Service
 
-Serviço de sincronização dos dados públicos de CNPJ da Receita Federal com um banco SQL Server. Descobre automaticamente o snapshot mais recente disponível, faz o download dos arquivos ZIP, extrai, processa e carrega os dados via bulk MERGE/INSERT, garantindo idempotência em todas as execuções.
+Serviço de sincronização dos dados públicos de CNPJ da Receita Federal para SQL Server.
 
-## Funcionalidades
+O fluxo atual é:
 
-- Descoberta automática do snapshot mais recente na Receita Federal (com fallback para mirror)
-- Download paralelo dos arquivos ZIP com retentativas e resume por HTTP Range
-- Extração e normalização dos CSVs (datas, decimais, encoding ISO-8859-1)
-- Carga incremental no SQL Server via bulk MERGE (upsert) — sem reprocessar snapshots já carregados
-- Controle de execução persistido em `cnpj.controle_sincronizacao`
-- Limpeza automática dos arquivos temporários após carga bem-sucedida
-- Relatório de execução em JSON salvo na pasta `logs/`
+1. Descobrir o snapshot mais recente.
+2. Reusar arquivos já baixados em `data/downloads` quando válidos.
+3. Reusar artefatos já processados em `data/processed` quando disponíveis.
+4. Extrair e normalizar os arquivos restantes.
+5. Carregar no SQL Server com `BCP + staging + MERGE/INSERT` quando `bcp.exe` estiver disponível.
 
-## Tabelas carregadas
+## Visão Geral
 
-| Tabela                  | Descrição                         | Volume estimado |
-| ----------------------- | --------------------------------- | --------------- |
-| `cnpj.empresas`         | Dados cadastrais da empresa       | ~60 M linhas    |
-| `cnpj.estabelecimentos` | Estabelecimentos (matriz/filiais) | ~60 M linhas    |
-| `cnpj.socios`           | Quadro societário                 | ~25 M linhas    |
-| `cnpj.simples`          | Optantes pelo Simples Nacional    | ~20 M linhas    |
-| `cnpj.cnaes`            | Tabela de CNAEs                   | ~100 linhas     |
-| `cnpj.motivos`          | Motivos de situação cadastral     | ~60 linhas      |
-| `cnpj.municipios`       | Municípios                        | ~5.500 linhas   |
-| `cnpj.naturezas`        | Naturezas jurídicas               | ~100 linhas     |
-| `cnpj.paises`           | Países                            | ~260 linhas     |
-| `cnpj.qualificacoes`    | Qualificações de sócios           | ~70 linhas      |
+- Descoberta automática via WebDAV da Receita Federal com fallback HTML.
+- Download paralelo com retentativa, resume por `Range` e validação local de ZIP.
+- Processamento em chunks para CSV e Parquet.
+- Carga incremental e idempotente no SQL Server.
+- Controle de execução em `cnpj.controle_sincronizacao` e `cnpj.controle_arquivos`.
+- Logs estruturados e relatório JSON por execução.
+- Arquitetura orientada a objeto no fluxo principal.
+
+## Arquitetura
+
+O projeto foi reorganizado para concentrar responsabilidades em classes de serviço:
+
+- [main.py](D:/cnpj-sync-service/main.py): `CNPJSyncApplication`
+- [src/crawler.py](D:/cnpj-sync-service/src/crawler.py): `SnapshotCrawler`
+- [src/downloader.py](D:/cnpj-sync-service/src/downloader.py): `FileDownloader`
+- [src/extractor.py](D:/cnpj-sync-service/src/extractor.py): `ZipExtractor`
+- [src/processor.py](D:/cnpj-sync-service/src/processor.py): `CSVProcessor`
+- [src/pipeline.py](D:/cnpj-sync-service/src/pipeline.py): `CNPJPipeline`
+- [src/sync.py](D:/cnpj-sync-service/src/sync.py): `CNPJSync`, `ProcessedFileReader`, `DataFrameNormalizer`
+- [src/database.py](D:/cnpj-sync-service/src/database.py): `SQLServerConnection`, `CNPJDatabase`
+
+As funções públicas dos módulos foram mantidas como fachadas finas para compatibilidade.
+
+## Carga no Banco
+
+O carregamento prioriza `bcp.exe` quando disponível.
+
+- `DB_LOAD_ENGINE=auto`: usa BCP quando encontrado no PATH, senão cai para `pyodbc`
+- `DB_LOAD_ENGINE=bcp`: exige `bcp.exe`
+- `DB_LOAD_ENGINE=pyodbc`: força o caminho antigo
+
+Hoje o caminho BCP cobre:
+
+- `Empresas`
+- `Estabelecimentos`
+- `Socios`
+- `Simples`
+- tabelas de referência (`Cnaes`, `Motivos`, `Municipios`, `Naturezas`, `Paises`, `Qualificacoes`)
+
+## Reuso de Artefatos
+
+Para reduzir tempo quando o banco foi limpo mas os arquivos locais já existem:
+
+- ZIPs válidos em `data/downloads` não são baixados novamente
+- artefatos em `data/processed` podem ser reutilizados
+
+Variáveis relevantes:
+
+- `FORCE_SYNC=true`: força redownload/reprocessamento
+- `REUSE_PROCESSED=true`: reutiliza `data/processed` quando possível
+
+Padrão atual:
+
+- `REUSE_PROCESSED=true`
+- se `FORCE_SYNC=true`, o reuse é desativado
 
 ## Pré-requisitos
 
 - Python 3.11+
-- SQL Server 2019+ com ODBC Driver 18 instalado
-- Acesso à internet para o site da Receita Federal
+- SQL Server acessível por ODBC
+- Microsoft ODBC Driver 18 for SQL Server
+- `bcp.exe` no PATH para melhor desempenho
 
 ## Instalação
 
@@ -41,124 +83,161 @@ pip install -r requirements.txt
 
 ## Configuração
 
-Crie um arquivo `.env` na raiz do projeto:
+Crie um arquivo `.env` na raiz:
 
 ```env
 DB_SERVER=seu-servidor
 DB_DATABASE=receita-federal
 DB_USERNAME=seu-usuario
 DB_PASSWORD=sua-senha
+
+LOG_LEVEL=INFO
+FORCE_SYNC=false
+REUSE_PROCESSED=true
+SNAPSHOT_DATE=
+DB_LOAD_ENGINE=auto
 ```
 
-As variáveis também podem ser passadas por linha de comando (veja abaixo).
+## Execução
 
-## Uso
+Execução padrão:
 
 ```bash
-# Sincronizar o snapshot mais recente
 python main.py
-
-# Forçar re-sincronização mesmo que o snapshot já tenha sido processado
-python main.py --force
-
-# Sincronizar uma data específica
-python main.py --date 2026-03-16
-
-# Ajustar nível de log e número de workers
-python main.py --log-level DEBUG --workers 8
-
-# Especificar credenciais diretamente
-python main.py --server 172.0.0.1 --database receita-federal --username sa --password senha
 ```
 
-### Argumentos disponíveis
-
-| Argumento           | Padrão         | Descrição                                            |
-| ------------------- | -------------- | ---------------------------------------------------- |
-| `--force`           | —              | Força sincronização mesmo que snapshot já processado |
-| `--date YYYY-MM-DD` | Mais recente   | Data específica do snapshot                          |
-| `--log-level`       | `INFO`         | Nível de log: `DEBUG`, `INFO`, `WARNING`, `ERROR`    |
-| `--server`          | `$DB_SERVER`   | Endereço do SQL Server                               |
-| `--database`        | `$DB_DATABASE` | Nome do banco de dados                               |
-| `--username`        | `$DB_USERNAME` | Usuário SQL Server                                   |
-| `--password`        | `$DB_PASSWORD` | Senha SQL Server                                     |
-| `--workers`         | `4`            | Número de workers para download e processamento      |
-
-## Docker
+Forçando reload completo:
 
 ```bash
-# Build
-docker build -t cnpj-sync-service .
-
-# Execução
-docker run --rm \
-  -e DB_SERVER=172.0.0.1 \
-  -e DB_DATABASE=receita-federal \
-  -e DB_USERNAME=sa \
-  -e DB_PASSWORD=SuaSenha \
-  -v /mnt/data:/app/data \
-  cnpj-sync-service
+set FORCE_SYNC=true
+python main.py
 ```
 
-O volume `/app/data` é usado para os arquivos temporários (downloads, CSVs extraídos e processados). Os arquivos são removidos automaticamente após a carga.
+Forçando engine BCP:
 
-## Estrutura do projeto
-
+```bash
+set DB_LOAD_ENGINE=bcp
+python main.py
 ```
+
+Forçando fallback `pyodbc`:
+
+```bash
+set DB_LOAD_ENGINE=pyodbc
+python main.py
+```
+
+Sincronizando um snapshot específico:
+
+```bash
+set SNAPSHOT_DATE=2026-03
+python main.py
+```
+
+ou:
+
+```bash
+set SNAPSHOT_DATE=2026-03-16
+python main.py
+```
+
+## Principais Configurações
+
+Em [src/config.py](D:/cnpj-sync-service/src/config.py):
+
+```python
+DOWNLOAD_WORKERS = 12
+EXTRACT_WORKERS = 4
+PROCESS_WORKERS = 4
+DATABASE_WORKERS = 2
+CSV_CHUNK_ROWS = 200_000
+STORAGE_BACKEND = "parquet"
+```
+
+## Estrutura do Projeto
+
+```text
 cnpj-sync-service/
-├── main.py                 # Entrypoint principal
+├── main.py
 ├── requirements.txt
-├── Dockerfile
 ├── sql/
-│   └── schema_prod.sql     # Schema SQL Server (idempotente)
+│   └── schema.sql
 ├── src/
-│   ├── config.py           # Constantes e configurações centrais
-│   ├── crawler.py          # Descoberta de snapshots (WebDAV + HTML fallback)
-│   ├── database.py         # Conexão e operações SQL Server
-│   ├── downloader.py       # Download paralelo com resume
-│   ├── extractor.py        # Extração dos ZIPs
-│   ├── logger.py           # Configuração do Loguru
-│   ├── models.py           # Modelos Pydantic do pipeline
-│   ├── pipeline.py         # Orquestração download → extração → processamento
-│   ├── processor.py        # Normalização dos CSVs brutos
-│   ├── storage.py          # Writer CSV
-│   └── sync.py             # Sincronização com o SQL Server (carga + controle)
-├── data/                   # Gerado em runtime (gitignore recomendado)
+│   ├── config.py
+│   ├── crawler.py
+│   ├── database.py
+│   ├── downloader.py
+│   ├── extractor.py
+│   ├── logger_enhanced.py
+│   ├── models.py
+│   ├── pipeline.py
+│   ├── processor.py
+│   ├── storage.py
+│   └── sync.py
+├── data/
 │   ├── downloads/
 │   ├── extracted/
 │   └── processed/
-└── logs/                   # Relatórios JSON por execução
+└── logs/
 ```
 
-## Fluxo de execução
+## Fluxo de Execução
 
-```
-main.py
-  └─ Descobre data do snapshot mais recente (Receita Federal)
-  └─ Verifica controle_sincronizacao (já processado?)
-  └─ CNPJSync.sync_snapshot()
-       ├─ run_pipeline()
-       │    ├─ Tabelas de referência (sequencial)
-       │    │    download → extract → process CSV
-       │    └─ Tabelas principais (paralelo, N workers)
-       │         download → extract → process CSV
-       ├─ Carrega cada CSV no SQL Server (bulk MERGE)
-       ├─ Atualiza controle_sincronizacao
-       └─ Remove arquivos temporários (data/)
+```text
+CNPJSyncApplication
+  -> CNPJSync
+     -> SnapshotCrawler
+     -> CNPJPipeline
+        -> FileDownloader
+        -> ZipExtractor
+        -> CSVProcessor
+     -> CNPJDatabase
 ```
 
-## Schema do banco
+Resumo do pipeline:
 
-O script `sql/schema_prod.sql` é idempotente (`IF NOT EXISTS`) e cria:
+- referência: download -> extract -> process -> load
+- grupos grandes: download paralelo -> extract paralelo -> process paralelo -> load em chunks
 
-- Schema `cnpj`
-- Todas as tabelas com índices otimizados para leitura e carga
-- Tabela `cnpj.controle_sincronizacao` para controle de execuções
-- Tabela `cnpj.controle_arquivos` para rastreamento por arquivo
+## Banco de Dados
 
-Execute manualmente ou deixe o serviço inicializar automaticamente na primeira execução.
+O schema é criado a partir de [sql/schema.sql](D:/cnpj-sync-service/sql/schema.sql).
 
-## Fontes de dados
+Tabelas principais:
 
-- **Primária:** [Receita Federal — Dados Abertos CNPJ](https://arquivos.receitafederal.gov.br)
-- **Fallback:** [dados-abertos-rf-cnpj.casadosdados.com.br](https://dados-abertos-rf-cnpj.casadosdados.com.br/arquivos/)
+- `cnpj.empresas`
+- `cnpj.estabelecimentos`
+- `cnpj.socios`
+- `cnpj.simples`
+- `cnpj.cnaes`
+- `cnpj.motivos`
+- `cnpj.municipios`
+- `cnpj.naturezas`
+- `cnpj.paises`
+- `cnpj.qualificacoes`
+- `cnpj.controle_sincronizacao`
+- `cnpj.controle_arquivos`
+
+## Logs e Observabilidade
+
+O projeto grava logs estruturados em `logs/` e também gera um relatório JSON por execução.
+
+Exemplos de informação coletada:
+
+- duração por etapa
+- bytes baixados
+- linhas processadas
+- linhas inválidas
+- arquivos com falha
+- resumo final da execução
+
+## Fontes de Dados
+
+- [Receita Federal](https://arquivos.receitafederal.gov.br)
+- [Casa dos Dados](https://dados-abertos-rf-cnpj.casadosdados.com.br/arquivos/)
+
+## Observações
+
+- O projeto hoje é configurado principalmente por variáveis de ambiente, não por argumentos CLI.
+- Não há suíte de testes no repositório.
+- `data/processed` pode ser preservado para acelerar recargas quando só o banco foi resetado.

@@ -23,208 +23,289 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+import pyarrow.parquet as pq
 import requests
 
 from src.config import (
+    DATABASE_WORKERS,
     DOWNLOAD_WORKERS,
     DOWNLOADS_DIR,
     EXTRACTED_DIR,
+    EXTRACT_WORKERS,
     HEADERS,
     PROCESS_WORKERS,
     PROCESSED_DIR,
     REFERENCE_FILES,
+    RF_AUTH,
+    STORAGE_BACKEND,
+    TOTAL_DOWNLOAD_WORKERS,
+    TOTAL_PROCESS_WORKERS,
 )
-from src.crawler import discover_latest_snapshot_with_fallback
-from src.downloader import download_file
-from src.extractor import extract_zip
-from src.logger import logger
-from src.models import DownloadResult, ExtractionResult, FileStatus, PipelineRun, ProcessingResult, RemoteFile
-from src.processor import process_csv
+from src.crawler import SnapshotCrawler, discover_latest_snapshot_with_fallback
+from src.downloader import FileDownloader, download_file, download_all
+from src.extractor import ZipExtractor, extract_zip, extract_all
+from src.logger_enhanced import logger, structured_logger
+from src.models import DownloadResult, ExtractionResult, FileStatus, PipelineRun, ProcessingResult, RemoteFile, Snapshot
+from src.processor import CSVProcessor, process_csv, process_all
+from src.storage import output_extension
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _file_pipeline(
-    remote_file: RemoteFile,
-    session: requests.Session,
-    snapshot_date: str,
-    force_download: bool = False,
-    force_extract: bool = False,
-) -> ProcessingResult:
-    """Full pipeline for a single file: download → extract → process."""
-    dl = download_file(remote_file, session, DOWNLOADS_DIR, force=force_download)
-    ex = extract_zip(dl, EXTRACTED_DIR, overwrite=force_extract)
-    pr = process_csv(ex, remote_file.group, PROCESSED_DIR)
-    return pr
+def _processed_output_path(remote_file: RemoteFile, output_dir: Path = PROCESSED_DIR) -> Path:
+    return output_dir / f"{remote_file.stem}{output_extension(STORAGE_BACKEND)}"
 
 
-# ---------------------------------------------------------------------------
-# Public pipeline entry points
-# ---------------------------------------------------------------------------
+def _count_processed_rows(path: Path) -> int:
+    if not path.exists():
+        return 0
+    if path.suffix.lower() == ".parquet":
+        return pq.ParquetFile(path).metadata.num_rows
+    if path.suffix.lower() == ".csv":
+        with path.open("r", encoding="utf-8", newline="") as fh:
+            return max(sum(1 for _ in fh) - 1, 0)
+    return 0
+
+
+def _reused_processed_result(remote_file: RemoteFile, output_dir: Path = PROCESSED_DIR) -> ProcessingResult | None:
+    output_path = _processed_output_path(remote_file, output_dir)
+    if not output_path.exists():
+        return None
+
+    local_zip = DOWNLOADS_DIR / remote_file.name
+    download_result = DownloadResult(
+        remote_file=remote_file,
+        local_path=local_zip,
+        status=FileStatus.SKIPPED,
+        bytes_downloaded=local_zip.stat().st_size if local_zip.exists() else 0,
+    )
+    extraction_result = ExtractionResult(
+        download_result=download_result,
+        status=FileStatus.SKIPPED,
+    )
+    rows_written = _count_processed_rows(output_path)
+    return ProcessingResult(
+        extraction_result=extraction_result,
+        output_path=output_path,
+        rows_written=rows_written,
+        status=FileStatus.DONE,
+    )
+
+
+class CNPJPipeline:
+    """Orquestrador OO do fluxo download -> extract -> process."""
+
+    def __init__(
+        self,
+        crawler: Optional[SnapshotCrawler] = None,
+        downloader: Optional[FileDownloader] = None,
+        extractor: Optional[ZipExtractor] = None,
+        processor: Optional[CSVProcessor] = None,
+    ) -> None:
+        self.crawler = crawler or SnapshotCrawler()
+        self.downloader = downloader or FileDownloader(dest_dir=DOWNLOADS_DIR, workers=DOWNLOAD_WORKERS)
+        self.extractor = extractor or ZipExtractor(dest_dir=EXTRACTED_DIR, workers=EXTRACT_WORKERS)
+        self.processor = processor or CSVProcessor(output_dir=PROCESSED_DIR, workers=PROCESS_WORKERS)
+
+    def _download_stage(
+        self,
+        files: list[RemoteFile],
+        force_download: bool = False,
+    ) -> list[DownloadResult]:
+        return self.downloader.download_all(files, force=force_download, workers=self.downloader.workers)
+
+    def _extract_stage(
+        self,
+        download_results: list[DownloadResult],
+        force_extract: bool = False,
+    ) -> list[ExtractionResult]:
+        return self.extractor.extract_all(download_results, overwrite=force_extract, workers=self.extractor.workers)
+
+    def _process_stage(
+        self,
+        extraction_results: list[ExtractionResult],
+    ) -> list[ProcessingResult]:
+        return self.processor.process_all(extraction_results, workers=self.processor.workers)
+
+    def run(
+        self,
+        groups: Optional[list[str]] = None,
+        snapshot_date: Optional[str] = None,
+        force_download: bool = False,
+        force_extract: bool = False,
+        download_workers: int = TOTAL_DOWNLOAD_WORKERS,
+        process_workers: int = TOTAL_PROCESS_WORKERS,
+        reference_only: bool = False,
+        snapshot: Optional["Snapshot"] = None,
+        reuse_processed: bool = False,
+    ) -> PipelineRun:
+        run = PipelineRun(
+            snapshot_date=snapshot_date or "latest",
+            started_at=datetime.utcnow(),
+        )
+
+        self.downloader.workers = download_workers
+        self.processor.workers = process_workers
+
+        session = self.crawler.create_session()
+        session.auth = RF_AUTH
+
+        try:
+            if snapshot is None:
+                snapshot = self.crawler.discover_latest_snapshot_with_fallback(session=session)
+            run.snapshot_date = snapshot.date
+            files = snapshot.files
+
+            if reference_only:
+                files = [f for f in files if f.group in REFERENCE_FILES]
+                logger.info("reference_only=True: {} files selected", len(files))
+            elif groups:
+                groups_set = {g.lower() for g in groups}
+                files = [f for f in files if f.group.lower() in groups_set]
+                logger.info("Group filter {}: {} files selected", groups, len(files))
+
+            if not files:
+                logger.warning("No files match the current filter — nothing to do")
+                run.finished_at = datetime.utcnow()
+                return run
+
+            if reuse_processed and not (force_download or force_extract):
+                reused_count = 0
+                pending_files: list[RemoteFile] = []
+                for remote_file in files:
+                    reused = _reused_processed_result(remote_file, PROCESSED_DIR)
+                    if reused is None:
+                        pending_files.append(remote_file)
+                        continue
+                    run.results.append(reused)
+                    reused_count += 1
+                    logger.info(
+                        "Reusing processed artifact for {} -> {}",
+                        remote_file.name,
+                        reused.output_path.name if reused.output_path else "",
+                    )
+                files = pending_files
+                if reused_count:
+                    logger.info(
+                        "Processed reuse: {} reutilizados, {} restantes",
+                        reused_count,
+                        len(files),
+                    )
+
+            if not files:
+                logger.info("All selected files already have processed artifacts — skipping pipeline stages")
+                run.finished_at = datetime.utcnow()
+                return run
+
+            logger.info("Processing {} files from snapshot {}", len(files), snapshot.date)
+
+            ref_files = [f for f in files if f.group in REFERENCE_FILES]
+            main_files = [f for f in files if f.group not in REFERENCE_FILES]
+
+            if ref_files:
+                ref_ok = ref_fail = 0
+                for rf in ref_files:
+                    dl = self.downloader.download_file(rf, session=session, force=force_download)
+                    if dl.status == FileStatus.FAILED:
+                        logger.error("Falha ao baixar referência {}", rf.name)
+                        ref_fail += 1
+                        continue
+                    ex = self.extractor.extract_zip(dl, overwrite=force_extract)
+                    if ex.status == FileStatus.FAILED:
+                        logger.error("Falha ao extrair referência {}", rf.name)
+                        ref_fail += 1
+                        continue
+                    pr = self.processor.process_csv(ex, rf.group)
+                    run.results.append(pr)
+                    ref_ok += 1
+                logger.info("Tabelas de referência: {} ok{}", ref_ok, f", {ref_fail} falhas" if ref_fail else "")
+
+            if main_files:
+                logger.info("Arquivos principais: {} arquivos", len(main_files))
+                download_results = self._download_stage(main_files, force_download)
+
+                successful_downloads = [
+                    dr for dr in download_results
+                    if dr.status in (FileStatus.DOWNLOADED, FileStatus.SKIPPED)
+                ]
+                failed_downloads = [dr for dr in download_results if dr.status == FileStatus.FAILED]
+
+                if failed_downloads:
+                    logger.warning("{} files failed to download", len(failed_downloads))
+                    for dr in failed_downloads:
+                        dummy_ex = ExtractionResult(
+                            download_result=dr,
+                            status=FileStatus.FAILED,
+                            error=dr.error,
+                        )
+                        run.results.append(
+                            ProcessingResult(
+                                extraction_result=dummy_ex,
+                                status=FileStatus.FAILED,
+                                error=dr.error,
+                            )
+                        )
+
+                if successful_downloads:
+                    extraction_results = self._extract_stage(successful_downloads, force_extract)
+                    successful_extractions = [
+                        er for er in extraction_results
+                        if er.status in (FileStatus.EXTRACTED, FileStatus.SKIPPED)
+                    ]
+                    failed_extractions = [er for er in extraction_results if er.status == FileStatus.FAILED]
+
+                    if failed_extractions:
+                        logger.warning("{} files failed to extract", len(failed_extractions))
+                        for er in failed_extractions:
+                            run.results.append(
+                                ProcessingResult(
+                                    extraction_result=er,
+                                    status=FileStatus.FAILED,
+                                    error=er.error,
+                                )
+                            )
+
+                    if successful_extractions:
+                        run.results.extend(self._process_stage(successful_extractions))
+
+        except Exception as exc:
+            logger.critical("Pipeline aborted: {}", exc)
+            raise
+
+        finally:
+            session.close()
+            run.finished_at = datetime.utcnow()
+            _save_run_report(run)
+            _log_summary(run)
+            structured_logger.info("=== PIPELINE END ===", operation="pipeline_complete")
+
+        return run
+
 
 def run_pipeline(
     groups: Optional[list[str]] = None,
     snapshot_date: Optional[str] = None,
     force_download: bool = False,
     force_extract: bool = False,
-    download_workers: int = DOWNLOAD_WORKERS,
-    process_workers: int = PROCESS_WORKERS,
+    download_workers: int = TOTAL_DOWNLOAD_WORKERS,
+    process_workers: int = TOTAL_PROCESS_WORKERS,
     reference_only: bool = False,
+    snapshot: Optional["Snapshot"] = None,
+    reuse_processed: bool = False,
 ) -> PipelineRun:
-    """
-    Execute the full scraping pipeline.
-
-    Parameters
-    ----------
-    groups:
-        Restrict processing to these file groups (e.g. ['Empresas', 'Socios']).
-        None means all groups.
-    snapshot_date:
-        Target a specific snapshot (YYYY-MM-DD).  None = use the latest.
-    force_download:
-        Re-download files even if they appear complete locally.
-    force_extract:
-        Re-extract even if the target CSV already exists.
-    download_workers:
-        Parallel download threads.
-    process_workers:
-        Parallel processing threads (extraction + CSV writing).
-    reference_only:
-        Only download and process the small reference/lookup tables.
-
-    Returns
-    -------
-    PipelineRun
-        Summary object with per-file results and aggregate statistics.
-    """
-    run = PipelineRun(
-        snapshot_date=snapshot_date or "latest",
-        started_at=datetime.utcnow(),
+    """Compatibilidade pública com a API funcional anterior."""
+    return CNPJPipeline().run(
+        groups=groups,
+        snapshot_date=snapshot_date,
+        force_download=force_download,
+        force_extract=force_extract,
+        download_workers=download_workers,
+        process_workers=process_workers,
+        reference_only=reference_only,
+        snapshot=snapshot,
+        reuse_processed=reuse_processed,
     )
-
-    session = requests.Session()
-    session.headers.update(HEADERS)
-
-    try:
-        # ------------------------------------------------------------------
-        # 1. Discover snapshot
-        # ------------------------------------------------------------------
-        logger.info("=== PIPELINE START ===")
-        snapshot = discover_latest_snapshot_with_fallback(session=session)
-
-        if snapshot_date and snapshot.date != snapshot_date:
-            logger.warning(
-                "Requested snapshot {} but latest is {}",
-                snapshot_date,
-                snapshot.date,
-            )
-
-        run.snapshot_date = snapshot.date
-
-        # ------------------------------------------------------------------
-        # 2. Filter files
-        # ------------------------------------------------------------------
-        files = snapshot.files
-
-        if reference_only:
-            files = [f for f in files if f.group in REFERENCE_FILES]
-            logger.info("reference_only=True: {} files selected", len(files))
-        elif groups:
-            groups_set = {g.lower() for g in groups}
-            files = [f for f in files if f.group.lower() in groups_set]
-            logger.info(
-                "Group filter {}: {} files selected", groups, len(files)
-            )
-
-        if not files:
-            logger.warning("No files match the current filter — nothing to do")
-            run.finished_at = datetime.utcnow()
-            return run
-
-        logger.info(
-            "Processing {} files from snapshot {}",
-            len(files),
-            snapshot.date,
-        )
-
-        # ------------------------------------------------------------------
-        # 3. Reference tables first (tiny, fast, sequential)
-        # ------------------------------------------------------------------
-        ref_files = [f for f in files if f.group in REFERENCE_FILES]
-        main_files = [f for f in files if f.group not in REFERENCE_FILES]
-
-        if ref_files:
-            logger.info("--- Reference tables ({}) ---", len(ref_files))
-            for rf in ref_files:
-                pr = _file_pipeline(
-                    rf, session, snapshot.date, force_download, force_extract,
-                )
-                run.results.append(pr)
-
-        # ------------------------------------------------------------------
-        # 4. Main data files — pipelined per-file with a thread pool
-        # ------------------------------------------------------------------
-        if main_files:
-            logger.info(
-                "--- Main data files ({}) with {} workers ---",
-                len(main_files),
-                process_workers,
-            )
-            with ThreadPoolExecutor(
-                max_workers=process_workers,
-                thread_name_prefix="pipe",
-            ) as pool:
-                future_to_file = {
-                    pool.submit(
-                        _file_pipeline,
-                        f,
-                        session,
-                        snapshot.date,
-                        force_download,
-                        force_extract,
-                    ): f
-                    for f in main_files
-                }
-                for future in as_completed(future_to_file):
-                    rf = future_to_file[future]
-                    try:
-                        pr = future.result()
-                    except Exception as exc:
-                        logger.error(
-                            "Unhandled error for {}: {}", rf.name, exc
-                        )
-                        # Build a failed result so the run summary is complete
-                        dummy_dl = DownloadResult(
-                            remote_file=rf,
-                            local_path=DOWNLOADS_DIR / rf.name,
-                            status=FileStatus.FAILED,
-                            error=str(exc),
-                        )
-                        dummy_ex = ExtractionResult(
-                            download_result=dummy_dl,
-                            status=FileStatus.FAILED,
-                            error=str(exc),
-                        )
-                        pr = ProcessingResult(
-                            extraction_result=dummy_ex,
-                            status=FileStatus.FAILED,
-                            error=str(exc),
-                        )
-                    run.results.append(pr)
-
-    except Exception as exc:
-        logger.critical("Pipeline aborted: {}", exc)
-        raise
-
-    finally:
-        session.close()
-        run.finished_at = datetime.utcnow()
-        _save_run_report(run)
-        _log_summary(run)
-        logger.info("=== PIPELINE END ===")
-
-    return run
 
 
 # ---------------------------------------------------------------------------
