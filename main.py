@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-Sincronização CNPJ com SQL Server — Script Principal
+Sincronização CNPJ com PostgreSQL — Script Principal
 
 Configuração via .env:
-    DB_SERVER        Endereço do SQL Server  (padrão: 72.60.4.227)
-    DB_DATABASE      Nome do banco           (padrão: receita-federal)
-    DB_USERNAME      Usuário SQL Server
-    DB_PASSWORD      Senha SQL Server
+    DATABASE_URL     URL completa PostgreSQL (opcional, tem prioridade)
+                     Ex: postgresql://user:pass@host:5432/db
+    DB_SERVER        Host do PostgreSQL      (padrão: localhost)
+    DB_DATABASE      Nome do banco           (padrão: postgres)
+    DB_USERNAME      Usuário PostgreSQL
+    DB_PASSWORD      Senha PostgreSQL
     LOG_LEVEL        DEBUG | INFO | WARNING | ERROR  (padrão: INFO)
     FORCE_SYNC       true | 1 — re-sincroniza mesmo que snapshot já processado
     SNAPSHOT_DATE    YYYY-MM ou YYYY-MM-DD — data específica (padrão: mais recente)
@@ -14,6 +16,7 @@ Configuração via .env:
 
 from __future__ import annotations
 
+import argparse
 import os
 import shutil
 import sys
@@ -26,14 +29,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from src.config import DOWNLOAD_WORKERS, DOWNLOADS_DIR, EXTRACTED_DIR, PROCESS_WORKERS, PROCESSED_DIR
-from src.database import CNPJDatabase
 from src.logger_enhanced import logger, setup_enhanced_logging, structured_logger
-from src.sync import CNPJSync
 
-_DB_SERVER     = os.getenv("DB_SERVER", "72.60.4.227")
-_DB_DATABASE   = os.getenv("DB_DATABASE", "receita-federal")
-_DB_USERNAME   = os.getenv("DB_USERNAME") or os.getenv("SQLSERVER_USERNAME")
-_DB_PASSWORD   = os.getenv("DB_PASSWORD") or os.getenv("SQLSERVER_PASSWORD")
+_DB_SERVER     = os.getenv("DB_SERVER", "localhost")
+_DB_DATABASE   = os.getenv("DB_DATABASE", "postgres")
+_DB_USERNAME   = os.getenv("DB_USERNAME") or os.getenv("POSTGRES_USER")
+_DB_PASSWORD   = os.getenv("DB_PASSWORD") or os.getenv("POSTGRES_PASSWORD")
 _LOG_LEVEL     = os.getenv("LOG_LEVEL", "INFO").upper()
 _FORCE         = os.getenv("FORCE_SYNC", "false").lower() in ("1", "true", "yes")
 _SNAPSHOT_DATE = os.getenv("SNAPSHOT_DATE")  # YYYY-MM ou YYYY-MM-DD, ou None
@@ -60,6 +61,13 @@ def _parse_snapshot_date(raw: str) -> date:
     if len(raw) == 7:
         return datetime.strptime(raw + "-01", "%Y-%m-%d").date()
     return datetime.strptime(raw, "%Y-%m-%d").date()
+
+
+def _positive_int(raw: str) -> int:
+    value = int(raw)
+    if value <= 0:
+        raise argparse.ArgumentTypeError("valor deve ser maior que zero")
+    return value
 
 
 def _fmt_elapsed(seconds: float) -> str:
@@ -116,6 +124,8 @@ class CNPJSyncApplication:
         force: bool = _FORCE,
         snapshot_date_raw: Optional[str] = _SNAPSHOT_DATE,
         reuse_processed_env: bool = _REUSE_PROCESSED,
+        download_workers: int = DOWNLOAD_WORKERS,
+        process_workers: int = PROCESS_WORKERS,
     ) -> None:
         self.server = server
         self.database = database
@@ -125,8 +135,12 @@ class CNPJSyncApplication:
         self.force = force
         self.snapshot_date_raw = snapshot_date_raw
         self.reuse_processed = reuse_processed_env and not force
+        self.download_workers = download_workers
+        self.process_workers = process_workers
 
-    def create_database(self) -> CNPJDatabase:
+    def create_database(self):
+        from src.database import CNPJDatabase
+
         return CNPJDatabase(
             server=self.server,
             database=self.database,
@@ -134,7 +148,9 @@ class CNPJSyncApplication:
             password=self.password,
         )
 
-    def create_sync(self, db: CNPJDatabase) -> CNPJSync:
+    def create_sync(self, db):
+        from src.sync import CNPJSync
+
         return CNPJSync(db_connection=db)
 
     def resolve_snapshot_date(self) -> Optional[date]:
@@ -176,8 +192,8 @@ class CNPJSyncApplication:
             groups=None,
             force_download=self.force,
             force_extract=self.force,
-            download_workers=DOWNLOAD_WORKERS,
-            process_workers=PROCESS_WORKERS,
+            download_workers=self.download_workers,
+            process_workers=self.process_workers,
             reference_only=False,
             force=self.force,
             reuse_processed=self.reuse_processed,
@@ -187,8 +203,55 @@ class CNPJSyncApplication:
         return _log_total_execution_time(result, elapsed)
 
 
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Sincronização CNPJ com PostgreSQL")
+    parser.add_argument("--force", action="store_true", default=_FORCE, help="Re-sincroniza mesmo se o snapshot já foi processado")
+    parser.add_argument("--date", dest="snapshot_date_raw", default=_SNAPSHOT_DATE, help="Snapshot alvo em YYYY-MM ou YYYY-MM-DD")
+    parser.add_argument("--log-level", default=_LOG_LEVEL, choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Nível de log")
+    parser.add_argument("--workers", type=_positive_int, help="Define o mesmo valor para download e processamento")
+    parser.add_argument("--download-workers", type=_positive_int, default=None, help="Workers de download")
+    parser.add_argument("--process-workers", type=_positive_int, default=None, help="Workers de processamento")
+    parser.add_argument("--server", default=_DB_SERVER, help="Host do PostgreSQL")
+    parser.add_argument("--database", default=_DB_DATABASE, help="Nome do banco PostgreSQL")
+    parser.add_argument("--username", default=_DB_USERNAME, help="Usuário do banco")
+    parser.add_argument("--password", default=_DB_PASSWORD, help="Senha do banco")
+    parser.add_argument(
+        "--reuse-processed",
+        dest="reuse_processed",
+        action="store_true",
+        default=_REUSE_PROCESSED,
+        help="Reaproveita artefatos processados já existentes",
+    )
+    parser.add_argument(
+        "--no-reuse-processed",
+        dest="reuse_processed",
+        action="store_false",
+        help="Descarta artefatos processados e reprocesa do zero",
+    )
+    return parser
+
+
 def main() -> None:
-    sys.exit(CNPJSyncApplication().run())
+    parser = _build_arg_parser()
+    args = parser.parse_args()
+
+    shared_workers = args.workers
+    download_workers = args.download_workers or shared_workers or DOWNLOAD_WORKERS
+    process_workers = args.process_workers or shared_workers or PROCESS_WORKERS
+
+    app = CNPJSyncApplication(
+        server=args.server,
+        database=args.database,
+        username=args.username,
+        password=args.password,
+        log_level=args.log_level,
+        force=args.force,
+        snapshot_date_raw=args.snapshot_date_raw,
+        reuse_processed_env=args.reuse_processed,
+        download_workers=download_workers,
+        process_workers=process_workers,
+    )
+    sys.exit(app.run())
 
 
 if __name__ == "__main__":

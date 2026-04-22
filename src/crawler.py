@@ -79,6 +79,34 @@ def _parse_date(raw: str) -> Optional[datetime]:
     return None
 
 
+def _select_snapshot_dir(available_dirs: list[str], requested: Optional[str] = None) -> str:
+    """Pick the latest snapshot, or resolve a requested month/day to a concrete folder."""
+    if not available_dirs:
+        raise RuntimeError("Nenhuma pasta de snapshot encontrada")
+
+    ordered = sorted(set(available_dirs))
+    if not requested:
+        return ordered[-1]
+
+    raw = requested.strip().rstrip("/")
+    candidates = [raw]
+    if _YYYY_MM_DD.match(raw):
+        candidates.append(raw[:7])
+
+    for candidate in candidates:
+        if candidate in ordered:
+            return candidate
+
+    if _YYYY_MM.match(raw):
+        daily_matches = [folder for folder in ordered if folder.startswith(raw + "-")]
+        if daily_matches:
+            return daily_matches[-1]
+
+    raise RuntimeError(
+        f"Snapshot solicitado '{requested}' não encontrado. Disponíveis: {ordered[-5:]}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Fonte primária: WebDAV Nextcloud
 # ---------------------------------------------------------------------------
@@ -101,23 +129,22 @@ def _propfind(url: str, session: requests.Session) -> ET.Element:
     return ET.fromstring(resp.text)
 
 
-def _latest_folder(session: requests.Session) -> str:
-    """Detecta automaticamente a pasta YYYY-MM mais recente."""
+def _webdav_snapshot_dirs(session: requests.Session) -> list[str]:
+    """Lista as pastas de snapshot disponíveis via WebDAV."""
     root = _propfind(RF_WEBDAV_BASE + "/", session)
-    pastas: list[str] = []
+    folders: list[str] = []
 
     for resp in root.findall("d:response", _DAV_NS):
         href = resp.find("d:href", _DAV_NS).text or ""
         nome = unquote(href.rstrip("/").split("/")[-1])
-        if _YYYY_MM.match(nome):
-            pastas.append(nome)
+        if _YYYY_MM.match(nome) or _YYYY_MM_DD.match(nome):
+            folders.append(nome)
 
-    if not pastas:
-        raise RuntimeError(f"Nenhuma pasta YYYY-MM encontrada em {RF_WEBDAV_BASE}/")
+    if not folders:
+        raise RuntimeError(f"Nenhuma pasta de snapshot encontrada em {RF_WEBDAV_BASE}/")
 
-    latest = sorted(pastas)[-1]
-    logger.debug("Pastas disponíveis: {} — mais recente: {}", len(pastas), latest)
-    return latest
+    logger.debug("Pastas WebDAV disponíveis: {}", len(folders))
+    return folders
 
 
 def _list_files_webdav(pasta: str, session: requests.Session) -> list[RemoteFile]:
@@ -163,11 +190,11 @@ def _list_files_webdav(pasta: str, session: requests.Session) -> list[RemoteFile
     return sorted(files, key=lambda f: f.name)
 
 
-def _discover_webdav(session: requests.Session) -> Snapshot:
-    """Descobre o snapshot mais recente via WebDAV."""
+def _discover_webdav(session: requests.Session, requested_snapshot: Optional[str] = None) -> Snapshot:
+    """Descobre um snapshot específico ou o mais recente via WebDAV."""
     session.auth = RF_AUTH
 
-    pasta = _latest_folder(session)
+    pasta = _select_snapshot_dir(_webdav_snapshot_dirs(session), requested_snapshot)
     files = _list_files_webdav(pasta, session)
 
     if not files:
@@ -250,8 +277,12 @@ def _parse_snapshot_listing_html(html: str, snapshot_url: str) -> list[RemoteFil
     return files
 
 
-def _discover_html(session: requests.Session, base_url: str) -> Snapshot:
-    """Descobre o snapshot mais recente via listagem HTML."""
+def _discover_html(
+    session: requests.Session,
+    base_url: str,
+    requested_snapshot: Optional[str] = None,
+) -> Snapshot:
+    """Descobre um snapshot específico ou o mais recente via listagem HTML."""
     logger.debug("Buscando índice HTML: {}", base_url)
     html = _fetch_html(base_url, session)
     soup = BeautifulSoup(html, "lxml")
@@ -265,9 +296,9 @@ def _discover_html(session: requests.Session, base_url: str) -> Snapshot:
     if not dated_dirs:
         raise RuntimeError(f"Nenhuma pasta de snapshot encontrada em {base_url}")
 
-    latest = sorted(dated_dirs)[-1]
+    latest = _select_snapshot_dir(dated_dirs, requested_snapshot)
     snapshot_url = base_url.rstrip("/") + "/" + latest + "/"
-    logger.debug("Snapshot mais recente: {}", latest)
+    logger.debug("Snapshot resolvido via HTML: {}", latest)
 
     snap_html = _fetch_html(snapshot_url, session)
     files = _parse_snapshot_listing_html(snap_html, snapshot_url)
@@ -305,8 +336,15 @@ class SnapshotCrawler:
         logger.debug("Fonte primária: WebDAV Receita Federal")
         return _discover_webdav(session)
 
+    def discover_snapshot(self, snapshot_ref: str, session: requests.Session) -> Snapshot:
+        logger.debug("Buscando snapshot solicitado: {}", snapshot_ref)
+        return _discover_webdav(session, requested_snapshot=snapshot_ref)
+
     def discover_fallback_snapshot(self, session: requests.Session) -> Snapshot:
         return _discover_html(session, self.fallback_base_url)
+
+    def discover_fallback_snapshot_for(self, snapshot_ref: str, session: requests.Session) -> Snapshot:
+        return _discover_html(session, self.fallback_base_url, requested_snapshot=snapshot_ref)
 
     def discover_latest_snapshot_with_fallback(
         self,
@@ -326,6 +364,29 @@ class SnapshotCrawler:
             if own_session:
                 session.close()
 
+    def discover_snapshot_with_fallback(
+        self,
+        snapshot_ref: str,
+        session: Optional[requests.Session] = None,
+    ) -> Snapshot:
+        own_session = session is None
+        if own_session:
+            session = self.create_session()
+
+        try:
+            try:
+                return self.discover_snapshot(snapshot_ref, session)
+            except Exception as exc:
+                logger.warning(
+                    "WebDAV RF falhou para snapshot {} ({}), tentando fallback HTML...",
+                    snapshot_ref,
+                    exc,
+                )
+                return self.discover_fallback_snapshot_for(snapshot_ref, session)
+        finally:
+            if own_session:
+                session.close()
+
 
 def discover_latest_snapshot_with_fallback(
     session: Optional[requests.Session] = None,
@@ -334,3 +395,11 @@ def discover_latest_snapshot_with_fallback(
     Tenta a fonte primária (WebDAV RF), cai no fallback (HTML casadosdados) se falhar.
     """
     return SnapshotCrawler().discover_latest_snapshot_with_fallback(session=session)
+
+
+def discover_snapshot_with_fallback(
+    snapshot_ref: str,
+    session: Optional[requests.Session] = None,
+) -> Snapshot:
+    """Resolve um snapshot específico com fallback da fonte primária para a secundária."""
+    return SnapshotCrawler().discover_snapshot_with_fallback(snapshot_ref, session=session)

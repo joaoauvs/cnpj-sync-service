@@ -1,11 +1,11 @@
 """
-Módulo de sincronização CNPJ com SQL Server.
+Módulo de sincronização CNPJ com PostgreSQL.
 
 Orquestra:
   1. Verificação de snapshot (evita reprocessamento)
   2. Download e extração dos arquivos via pipeline
   3. Leitura do CSV + limpeza dos dados
-  4. Bulk MERGE/INSERT no SQL Server (via CNPJDatabase)
+  4. Bulk upsert no PostgreSQL via COPY + INSERT ON CONFLICT (via CNPJDatabase)
   5. Atualização do controle de execução
 """
 
@@ -21,7 +21,7 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 from src.config import CSV_CHUNK_ROWS, CSV_ENCODING, CSV_SEPARATOR, DATE_COLUMNS, DECIMAL_COLUMNS, HEADERS, RF_AUTH, SCHEMAS, STORAGE_BACKEND
-from src.crawler import SnapshotCrawler, discover_latest_snapshot_with_fallback
+from src.crawler import SnapshotCrawler
 from src.database import CNPJDatabase
 from src.logger_enhanced import logger, structured_logger
 from src.models import RemoteFile, Snapshot
@@ -133,7 +133,7 @@ class ProcessedFileReader:
 # ---------------------------------------------------------------------------
 
 class CNPJSync:
-    """Orquestra a sincronização completa CNPJ → SQL Server."""
+    """Orquestra a sincronização completa CNPJ → PostgreSQL."""
 
     def __init__(
         self,
@@ -185,6 +185,12 @@ class CNPJSync:
     # ------------------------------------------------------------------
     # Controle de sessão
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _canonical_snapshot_date(snapshot_label: str) -> date:
+        if len(snapshot_label) == 7:
+            return datetime.strptime(snapshot_label + "-01", "%Y-%m-%d").date()
+        return datetime.strptime(snapshot_label, "%Y-%m-%d").date()
 
     def check_snapshot_needs_sync(self, snapshot_date: date) -> Tuple[bool, str]:
         """
@@ -257,12 +263,13 @@ class CNPJSync:
         logger.debug("Carregando referência {}: {}", group, file_path.name)
         try:
             df = self._read_processed_file(file_path, group)
-            df = self.normalizer.clean(df, group)
-            affected = self.db.bulk_upsert_reference(
-                table=group.lower(),
-                df=df,
-                snapshot_date=snapshot_date,
-            )
+            with self.db.connect() as conn:
+                affected = self.db.bulk_upsert_reference(
+                    table=group.lower(),
+                    df=df,
+                    snapshot_date=snapshot_date,
+                    conn=conn,
+                )
             logger.info("{}: {} linhas mescladas", group, affected)
             return affected
         except Exception as e:
@@ -275,11 +282,16 @@ class CNPJSync:
         total_inserted = total_updated = 0
         try:
             reader = self._read_processed_file(file_path, "Empresas", chunksize=self.chunk_size)
-            for chunk in reader:
-                chunk = self.normalizer.clean(chunk, "Empresas")
-                ins, upd = self.db.bulk_upsert_empresas(chunk, snapshot_date)
-                total_inserted += ins
-                total_updated += upd
+            with self.db.connect() as conn:
+                for chunk in reader:
+                    try:
+                        ins, upd = self.db.bulk_upsert_empresas(chunk, snapshot_date, conn=conn)
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+                        raise
+                    total_inserted += ins
+                    total_updated += upd
             logger.info("Empresas: {} inseridas, {} atualizadas", total_inserted, total_updated)
             return total_inserted, total_updated
         except Exception as e:
@@ -292,11 +304,16 @@ class CNPJSync:
         total_inserted = total_updated = 0
         try:
             reader = self._read_processed_file(file_path, "Estabelecimentos", chunksize=self.chunk_size)
-            for chunk in reader:
-                chunk = self.normalizer.clean(chunk, "Estabelecimentos")
-                ins, upd = self.db.bulk_upsert_estabelecimentos(chunk, snapshot_date)
-                total_inserted += ins
-                total_updated += upd
+            with self.db.connect() as conn:
+                for chunk in reader:
+                    try:
+                        ins, upd = self.db.bulk_upsert_estabelecimentos(chunk, snapshot_date, conn=conn)
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+                        raise
+                    total_inserted += ins
+                    total_updated += upd
             logger.info("Estabelecimentos: {} inseridos, {} atualizados", total_inserted, total_updated)
             return total_inserted, total_updated
         except Exception as e:
@@ -309,10 +326,15 @@ class CNPJSync:
         total = 0
         try:
             reader = self._read_processed_file(file_path, "Socios", chunksize=self.chunk_size)
-            for chunk in reader:
-                chunk = self.normalizer.clean(chunk, "Socios")
-                n = self.db.bulk_insert_socios(chunk, snapshot_date)
-                total += n
+            with self.db.connect() as conn:
+                for chunk in reader:
+                    try:
+                        n = self.db.bulk_insert_socios(chunk, snapshot_date, conn=conn)
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+                        raise
+                    total += n
             logger.info("Socios: {} inseridos", total)
             return total
         except Exception as e:
@@ -325,11 +347,16 @@ class CNPJSync:
         total_inserted = total_updated = 0
         try:
             reader = self._read_processed_file(file_path, "Simples", chunksize=self.chunk_size)
-            for chunk in reader:
-                chunk = self.normalizer.clean(chunk, "Simples")
-                ins, upd = self.db.bulk_upsert_simples(chunk, snapshot_date)
-                total_inserted += ins
-                total_updated += upd
+            with self.db.connect() as conn:
+                for chunk in reader:
+                    try:
+                        ins, upd = self.db.bulk_upsert_simples(chunk, snapshot_date, conn=conn)
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+                        raise
+                    total_inserted += ins
+                    total_updated += upd
             logger.info("Simples: {} inseridos, {} atualizados", total_inserted, total_updated)
             return total_inserted, total_updated
         except Exception as e:
@@ -363,6 +390,12 @@ class CNPJSync:
         logger.warning("Grupo desconhecido ignorado: {}", group)
         return 0
 
+    def _analyze_loaded_groups(self, groups: List[str]) -> None:
+        try:
+            self.db.analyze_groups(groups)
+        except Exception as e:
+            logger.warning("Falha ao executar ANALYZE pós-carga: {}", e)
+
     # ------------------------------------------------------------------
     # Pipeline principal
     # ------------------------------------------------------------------
@@ -386,23 +419,33 @@ class CNPJSync:
           1. Descobre o snapshot (uma única chamada ao crawler)
           2. Verifica idempotência
           3. Download → extração → processamento
-          4. Carga no SQL Server via bulk MERGE
+          4. Carga no PostgreSQL via COPY + INSERT ON CONFLICT
           5. Atualiza controle_sincronizacao
           6. Remove arquivos temporários se sucesso
         """
         import requests as _req
+        requested_snapshot_ref = snapshot_date.isoformat() if snapshot_date else None
         _session = self.snapshot_crawler.create_session()
         _session.auth = RF_AUTH
         try:
-            snapshot_obj: Snapshot = self.snapshot_crawler.discover_latest_snapshot_with_fallback(session=_session)
+            if requested_snapshot_ref:
+                snapshot_obj = self.snapshot_crawler.discover_snapshot_with_fallback(
+                    requested_snapshot_ref,
+                    session=_session,
+                )
+            else:
+                snapshot_obj = self.snapshot_crawler.discover_latest_snapshot_with_fallback(session=_session)
         finally:
             _session.close()
 
-        # Resolve data alvo: usa a do env/argumento ou a do snapshot descoberto
-        if snapshot_date is None:
-            raw = snapshot_obj.date
-            snapshot_date = datetime.strptime(raw + "-01", "%Y-%m-%d").date() if len(raw) == 7 \
-                else datetime.strptime(raw, "%Y-%m-%d").date()
+        canonical_snapshot_date = self._canonical_snapshot_date(snapshot_obj.date)
+        if requested_snapshot_ref and requested_snapshot_ref != snapshot_obj.date:
+            logger.info(
+                "Snapshot solicitado {} resolvido para {}",
+                requested_snapshot_ref,
+                snapshot_obj.date,
+            )
+        snapshot_date = canonical_snapshot_date
 
         logger.info("=== INÍCIO SINCRONIZAÇÃO snapshot={} ===", snapshot_obj.date)
 
@@ -422,6 +465,7 @@ class CNPJSync:
 
         total_files = successful_files = failed_files = 0
         total_records = 0
+        loaded_groups: set[str] = set()
 
         try:
             # 1. Executar pipeline com o snapshot já descoberto (sem nova chamada ao crawler)
@@ -439,11 +483,22 @@ class CNPJSync:
 
             total_files = len(pipeline_result.results)
 
-            # 2. Carregar cada arquivo processado no SQL Server
+            # Arquivos já carregados com sucesso em execuções anteriores deste snapshot
+            already_loaded = self.db.get_successfully_loaded_files(snapshot_date)
+            if already_loaded:
+                logger.info("{} arquivo(s) já carregados anteriormente, serão pulados", len(already_loaded))
+
+            # 2. Carregar cada arquivo processado no PostgreSQL
             for pr in pipeline_result.results:
                 remote_file = pr.extraction_result.download_result.remote_file
                 filename = remote_file.name
                 group = remote_file.group
+
+                if filename in already_loaded:
+                    logger.info("Arquivo {} já carregado (SUCESSO anterior), pulando", filename)
+                    total_records += already_loaded[filename]
+                    successful_files += 1
+                    continue
 
                 self._register_file(remote_file)
 
@@ -458,6 +513,7 @@ class CNPJSync:
                     self._update_file(filename, "SUCESSO", total=records, invalid=pr.rows_invalid)
                     total_records += records
                     successful_files += 1
+                    loaded_groups.add(group)
                 except Exception as e:
                     self._update_file(filename, "FALHA", error=str(e))
                     logger.error("Erro ao carregar {} no banco: {}", filename, e)
@@ -488,7 +544,8 @@ class CNPJSync:
                         successful_files, total_files, total_records)
 
             if failed_files == 0:
-                self._cleanup_temp_files(snapshot_date)
+                self._analyze_loaded_groups(sorted(loaded_groups))
+                self._cleanup_temp_files(snapshot_obj.date, preserve_processed=reuse_processed)
 
             return result
 
@@ -515,19 +572,17 @@ class CNPJSync:
     # Limpeza
     # ------------------------------------------------------------------
 
-    def _cleanup_temp_files(self, snapshot_date: date) -> None:
+    def _cleanup_temp_files(self, snapshot_label: str, preserve_processed: bool = False) -> None:
         from src.config import DOWNLOADS_DIR, EXTRACTED_DIR, PROCESSED_DIR
 
-        snap_str = str(snapshot_date)
         for base_dir in (DOWNLOADS_DIR, EXTRACTED_DIR):
-            target = base_dir / snap_str
+            target = base_dir / snapshot_label
             if target.exists():
                 shutil.rmtree(target, ignore_errors=True)
                 logger.debug("Removido: {}", target)
 
-        # Processed: remove arquivos carregados no DB
-        processed_snap = PROCESSED_DIR / snap_str
-        if processed_snap.exists():
+        processed_snap = PROCESSED_DIR / snapshot_label
+        if processed_snap.exists() and not preserve_processed:
             shutil.rmtree(processed_snap, ignore_errors=True)
             logger.debug("Removido: {}", processed_snap)
 
@@ -539,8 +594,8 @@ class CNPJSync:
         try:
             if exec_id is None:
                 rows = self.db.execute_query(
-                    f"SELECT TOP 1 id_execucao FROM {self.db.schema}.controle_sincronizacao "
-                    "ORDER BY data_inicio_execucao DESC"
+                    f"SELECT id_execucao FROM {self.db.schema}.controle_sincronizacao "
+                    "ORDER BY data_inicio_execucao DESC LIMIT 1"
                 )
                 if not rows:
                     return {"error": "Nenhuma execução encontrada"}

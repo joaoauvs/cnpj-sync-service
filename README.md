@@ -1,243 +1,155 @@
 # CNPJ Sync Service
 
-Serviço de sincronização dos dados públicos de CNPJ da Receita Federal para SQL Server.
+Serviço de sincronização dos dados públicos de CNPJ da Receita Federal para PostgreSQL.
 
-O fluxo atual é:
+Baixa, extrai, normaliza e carrega ~214 milhões de registros via `COPY FROM STDIN` com upsert idempotente, suportando reuso de artefatos entre execuções.
 
-1. Descobrir o snapshot mais recente.
-2. Reusar arquivos já baixados em `data/downloads` quando válidos.
-3. Reusar artefatos já processados em `data/processed` quando disponíveis.
-4. Extrair e normalizar os arquivos restantes.
-5. Carregar no SQL Server com `BCP + staging + MERGE/INSERT` quando `bcp.exe` estiver disponível.
+## Fluxo Resumido
 
-## Visão Geral
+```
+Descoberta de snapshot → Download paralelo → Extração → Processamento → Carga no PostgreSQL
+```
 
-- Descoberta automática via WebDAV da Receita Federal com fallback HTML.
-- Download paralelo com retentativa, resume por `Range` e validação local de ZIP.
-- Processamento em chunks para CSV e Parquet.
-- Carga incremental e idempotente no SQL Server.
-- Controle de execução em `cnpj.controle_sincronizacao` e `cnpj.controle_arquivos`.
-- Logs estruturados e relatório JSON por execução.
-- Arquitetura orientada a objeto no fluxo principal.
-
-## Arquitetura
-
-O projeto foi reorganizado para concentrar responsabilidades em classes de serviço:
-
-- [main.py](D:/cnpj-sync-service/main.py): `CNPJSyncApplication`
-- [src/crawler.py](D:/cnpj-sync-service/src/crawler.py): `SnapshotCrawler`
-- [src/downloader.py](D:/cnpj-sync-service/src/downloader.py): `FileDownloader`
-- [src/extractor.py](D:/cnpj-sync-service/src/extractor.py): `ZipExtractor`
-- [src/processor.py](D:/cnpj-sync-service/src/processor.py): `CSVProcessor`
-- [src/pipeline.py](D:/cnpj-sync-service/src/pipeline.py): `CNPJPipeline`
-- [src/sync.py](D:/cnpj-sync-service/src/sync.py): `CNPJSync`, `ProcessedFileReader`, `DataFrameNormalizer`
-- [src/database.py](D:/cnpj-sync-service/src/database.py): `SQLServerConnection`, `CNPJDatabase`
-
-As funções públicas dos módulos foram mantidas como fachadas finas para compatibilidade.
-
-## Carga no Banco
-
-O carregamento prioriza `bcp.exe` quando disponível.
-
-- `DB_LOAD_ENGINE=auto`: usa BCP quando encontrado no PATH, senão cai para `pyodbc`
-- `DB_LOAD_ENGINE=bcp`: exige `bcp.exe`
-- `DB_LOAD_ENGINE=pyodbc`: força o caminho antigo
-
-Hoje o caminho BCP cobre:
-
-- `Empresas`
-- `Estabelecimentos`
-- `Socios`
-- `Simples`
-- tabelas de referência (`Cnaes`, `Motivos`, `Municipios`, `Naturezas`, `Paises`, `Qualificacoes`)
-
-## Reuso de Artefatos
-
-Para reduzir tempo quando o banco foi limpo mas os arquivos locais já existem:
-
-- ZIPs válidos em `data/downloads` não são baixados novamente
-- artefatos em `data/processed` podem ser reutilizados
-
-Variáveis relevantes:
-
-- `FORCE_SYNC=true`: força redownload/reprocessamento
-- `REUSE_PROCESSED=true`: reutiliza `data/processed` quando possível
-
-Padrão atual:
-
-- `REUSE_PROCESSED=true`
-- se `FORCE_SYNC=true`, o reuse é desativado
+1. Descobre o snapshot mais recente via WebDAV da Receita Federal (fallback: Casa dos Dados)
+2. Reutiliza ZIPs em `data/downloads/` e artefatos em `data/processed/` quando válidos
+3. Extrai ZIPs e normaliza CSVs (datas, decimais, encoding latin-1)
+4. Carrega no PostgreSQL via `COPY FROM STDIN` + `INSERT … ON CONFLICT … DO UPDATE`
+5. Registra progresso em `cnpj.controle_sincronizacao` e `cnpj.controle_arquivos`
 
 ## Pré-requisitos
 
 - Python 3.11+
-- SQL Server acessível por ODBC
-- Microsoft ODBC Driver 18 for SQL Server
-- `bcp.exe` no PATH para melhor desempenho
+- PostgreSQL 14+ acessível pela rede
 
 ## Instalação
 
 ```bash
+python -m venv .venv
+.venv\Scripts\activate        # Windows
 pip install -r requirements.txt
 ```
 
 ## Configuração
 
-Crie um arquivo `.env` na raiz:
+Crie `.env` na raiz (veja `.env.example`):
 
 ```env
-DB_SERVER=seu-servidor
-DB_DATABASE=receita-federal
+# Conexão PostgreSQL
+DB_SERVER=seu-host
+DB_DATABASE=sandbox
 DB_USERNAME=seu-usuario
 DB_PASSWORD=sua-senha
 
-LOG_LEVEL=INFO
-FORCE_SYNC=false
-REUSE_PROCESSED=true
-SNAPSHOT_DATE=
-DB_LOAD_ENGINE=auto
+# Alternativa: URL completa (tem prioridade sobre as variáveis acima)
+# DATABASE_URL=postgresql://usuario:senha@host:5432/banco
+
+# Comportamento
+LOG_LEVEL=INFO           # DEBUG | INFO | WARNING | ERROR
+FORCE_SYNC=false         # true → reprocessa mesmo snapshot já carregado
+REUSE_PROCESSED=true     # true → reutiliza data/processed/ entre execuções
+SNAPSHOT_DATE=           # vazio → snapshot mais recente; ex: 2026-04 ou 2026-04-01
 ```
 
 ## Execução
 
-Execução padrão:
-
 ```bash
+# Sincronização completa com o snapshot mais recente
 python main.py
-```
 
-Forçando reload completo:
+# Forçar redownload e reprocessamento
+set FORCE_SYNC=true && python main.py        # Windows
+FORCE_SYNC=true python main.py              # Linux/macOS
 
-```bash
-set FORCE_SYNC=true
-python main.py
-```
+# Snapshot específico
+set SNAPSHOT_DATE=2026-04 && python main.py
 
-Forçando engine BCP:
-
-```bash
-set DB_LOAD_ENGINE=bcp
-python main.py
-```
-
-Forçando fallback `pyodbc`:
-
-```bash
-set DB_LOAD_ENGINE=pyodbc
-python main.py
-```
-
-Sincronizando um snapshot específico:
-
-```bash
-set SNAPSHOT_DATE=2026-03
-python main.py
-```
-
-ou:
-
-```bash
-set SNAPSHOT_DATE=2026-03-16
-python main.py
-```
-
-## Principais Configurações
-
-Em [src/config.py](D:/cnpj-sync-service/src/config.py):
-
-```python
-DOWNLOAD_WORKERS = 12
-EXTRACT_WORKERS = 4
-PROCESS_WORKERS = 4
-DATABASE_WORKERS = 2
-CSV_CHUNK_ROWS = 200_000
-STORAGE_BACKEND = "parquet"
+# Nível de log detalhado
+set LOG_LEVEL=DEBUG && python main.py
 ```
 
 ## Estrutura do Projeto
 
-```text
+```
 cnpj-sync-service/
-├── main.py
+├── main.py                  # Entrypoint — CNPJSyncApplication
 ├── requirements.txt
+├── .env.example
 ├── sql/
-│   └── schema.sql
+│   └── schema.sql           # DDL idempotente (PostgreSQL 14+)
 ├── src/
-│   ├── config.py
-│   ├── crawler.py
-│   ├── database.py
-│   ├── downloader.py
-│   ├── extractor.py
-│   ├── logger_enhanced.py
-│   ├── models.py
-│   ├── pipeline.py
-│   ├── processor.py
-│   ├── storage.py
-│   └── sync.py
+│   ├── config.py            # Todas as constantes configuráveis
+│   ├── crawler.py           # Descoberta de snapshot (WebDAV / HTML)
+│   ├── database.py          # Operações PostgreSQL (COPY, upserts, controle)
+│   ├── downloader.py        # Download paralelo com resume e retry
+│   ├── extractor.py         # Extração de ZIPs
+│   ├── logger_enhanced.py   # Logger estruturado (Loguru)
+│   ├── models.py            # Modelos Pydantic v2 do pipeline
+│   ├── pipeline.py          # Orquestração download → extract → process
+│   ├── processor.py         # Normalização de CSVs → parquet/csv processado
+│   ├── storage.py           # Writers plugáveis (CSV ou Parquet)
+│   └── sync.py              # CNPJSync — coordena pipeline + carga no banco
 ├── data/
-│   ├── downloads/
-│   ├── extracted/
-│   └── processed/
-└── logs/
+│   ├── downloads/           # ZIPs baixados (preservados entre execuções)
+│   ├── extracted/           # CSVs extraídos (removidos após processamento)
+│   └── processed/           # Artefatos normalizados (parquet/csv)
+├── logs/                    # Logs por execução
+└── docs/                    # Documentação técnica detalhada
 ```
 
-## Fluxo de Execução
+## Arquitetura
 
-```text
-CNPJSyncApplication
-  -> CNPJSync
-     -> SnapshotCrawler
-     -> CNPJPipeline
-        -> FileDownloader
-        -> ZipExtractor
-        -> CSVProcessor
-     -> CNPJDatabase
+```
+CNPJSyncApplication (main.py)
+  └── CNPJSync (sync.py)
+        ├── SnapshotCrawler      → descobre snapshot
+        ├── CNPJPipeline
+        │     ├── FileDownloader → download paralelo (12 workers)
+        │     ├── ZipExtractor   → extração (4 workers)
+        │     └── CSVProcessor   → normalização (4 workers)
+        └── CNPJDatabase         → COPY + upsert no PostgreSQL
 ```
 
-Resumo do pipeline:
-
-- referência: download -> extract -> process -> load
-- grupos grandes: download paralelo -> extract paralelo -> process paralelo -> load em chunks
+Veja [`docs/architecture.md`](docs/architecture.md) para detalhe completo.
 
 ## Banco de Dados
 
-O schema é criado a partir de [sql/schema.sql](D:/cnpj-sync-service/sql/schema.sql).
+Schema criado a partir de `sql/schema.sql` (idempotente). Tabelas no schema `cnpj`:
 
-Tabelas principais:
+| Tabela | Tipo | Linhas (aprox.) |
+|---|---|---|
+| `empresas` | principal | ~60 M |
+| `estabelecimentos` | principal | ~62 M |
+| `socios` | principal | ~25 M |
+| `simples` | principal | ~40 M |
+| `cnaes` / `motivos` / `municipios` / `naturezas` / `paises` / `qualificacoes` | referência | < 10 K cada |
+| `controle_sincronizacao` | controle | 1 por execução |
+| `controle_arquivos` | controle | 1 por arquivo |
 
-- `cnpj.empresas`
-- `cnpj.estabelecimentos`
-- `cnpj.socios`
-- `cnpj.simples`
-- `cnpj.cnaes`
-- `cnpj.motivos`
-- `cnpj.municipios`
-- `cnpj.naturezas`
-- `cnpj.paises`
-- `cnpj.qualificacoes`
-- `cnpj.controle_sincronizacao`
-- `cnpj.controle_arquivos`
+Veja [`docs/database.md`](docs/database.md) para o schema completo.
 
-## Logs e Observabilidade
+## Configurações de Performance
 
-O projeto grava logs estruturados em `logs/` e também gera um relatório JSON por execução.
+Em `src/config.py`:
 
-Exemplos de informação coletada:
+```python
+DOWNLOAD_WORKERS = 12      # threads de download (limitado pela rede)
+EXTRACT_WORKERS  = 4       # threads de extração (limitado por disco)
+PROCESS_WORKERS  = 4       # threads de processamento (limitado por CPU)
+CSV_CHUNK_ROWS   = 200_000 # linhas por chunk pandas (controle de memória)
+STORAGE_BACKEND  = "parquet"  # "csv" ou "parquet"
+```
 
-- duração por etapa
-- bytes baixados
-- linhas processadas
-- linhas inválidas
-- arquivos com falha
-- resumo final da execução
+## Documentação
+
+| Documento | Conteúdo |
+|---|---|
+| [`docs/architecture.md`](docs/architecture.md) | Arquitetura detalhada e fluxo de dados |
+| [`docs/database.md`](docs/database.md) | Schema SQL e estratégia de carga |
+| [`docs/configuration.md`](docs/configuration.md) | Todas as variáveis de ambiente e constantes |
+| [`docs/data-pipeline.md`](docs/data-pipeline.md) | Etapas de processamento e normalização |
+| [`docs/troubleshooting.md`](docs/troubleshooting.md) | Erros conhecidos e soluções |
 
 ## Fontes de Dados
 
-- [Receita Federal](https://arquivos.receitafederal.gov.br)
-- [Casa dos Dados](https://dados-abertos-rf-cnpj.casadosdados.com.br/arquivos/)
-
-## Observações
-
-- O projeto hoje é configurado principalmente por variáveis de ambiente, não por argumentos CLI.
-- Não há suíte de testes no repositório.
-- `data/processed` pode ser preservado para acelerar recargas quando só o banco foi resetado.
+- Fonte primária: [arquivos.receitafederal.gov.br](https://arquivos.receitafederal.gov.br) (WebDAV)
+- Fallback: [dados-abertos-rf-cnpj.casadosdados.com.br](https://dados-abertos-rf-cnpj.casadosdados.com.br/arquivos/)

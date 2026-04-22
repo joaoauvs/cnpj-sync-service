@@ -1,83 +1,131 @@
 # AGENTS.md
 
-This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
+Guia para agentes de IA (Claude Code, Codex, Copilot) que trabalham neste repositório.
 
-## Commands
+## Comandos Essenciais
 
 ```bash
-# Install dependencies
+# Instalar dependências
 pip install -r requirements.txt
 
-# Run full sync (latest snapshot)
+# Executar sincronização completa
 python main.py
 
-# Common flags
-python main.py --force                        # re-sync even if already processed
-python main.py --date 2026-03-16              # target specific snapshot
-python main.py --log-level DEBUG --workers 8  # tune verbosity and parallelism
-python main.py --server HOST --database DB --username USER --password PASS
+# Sincronizar snapshot específico
+set SNAPSHOT_DATE=2026-04 && python main.py       # Windows
+SNAPSHOT_DATE=2026-04 python main.py              # Linux/macOS
+
+# Forçar reprocessamento completo
+set FORCE_SYNC=true && python main.py
+
+# Reutilizar artefatos processados (apenas recarregar no banco)
+set REUSE_PROCESSED=true && python main.py
+
+# Log detalhado
+set LOG_LEVEL=DEBUG && python main.py
 ```
 
-There is no test suite and no linter configuration in the repo.
+> **Atenção**: o projeto usa variáveis de ambiente, não flags CLI. Não existe `--force`, `--date` ou `--workers`.
 
-## Architecture
+Não há suite de testes nem configuração de linter no repositório.
 
-The service downloads public CNPJ data from Receita Federal, transforms it, and bulk-loads it into SQL Server. The entrypoint is `main.py`; all logic lives in `src/`.
+## Arquitetura
 
-### End-to-end flow
+O serviço baixa dados públicos de CNPJ da Receita Federal, normaliza e carrega em bulk no PostgreSQL. Entrypoint: `main.py`. Toda a lógica está em `src/`.
+
+### Fluxo End-to-End
 
 ```
-main.py
-  ├── CNPJDatabase (pyodbc connection to SQL Server)
-  ├── CNPJSync.check_snapshot_needs_sync()   ← idempotency gate via controle_sincronizacao
+main.py (CNPJSyncApplication)
+  ├── CNPJDatabase              ← conexão psycopg2 ao PostgreSQL
+  ├── CNPJSync.check_snapshot_needs_sync()   ← idempotência via controle_sincronizacao
   └── CNPJSync.sync_snapshot()
-        ├── run_pipeline()                   ← download → extract → process
-        │     ├── Reference files (sequential): download_file → extract_zip → process_csv
-        │     └── Main files (stage-parallel):
-        │           download_all (12 workers) → extract_all (4) → process_all (4)
-        ├── _dispatch_group() per file       ← bulk MERGE/INSERT into SQL Server
-        ├── update_sync_session()            ← mark SUCESSO/FALHA
-        └── _cleanup_temp_files()            ← removes data/ on success
+        ├── CNPJPipeline.run()
+        │     ├── Arquivos de referência (sequencial):
+        │     │     download → extract → process → load
+        │     └── Arquivos principais (paralelo por estágio):
+        │           download_all (12 workers)
+        │           → extract_all (4 workers)
+        │           → process_all (4 workers)
+        ├── _dispatch_group() por arquivo    ← COPY + INSERT ON CONFLICT
+        ├── update_sync_session()            ← marca SUCESSO ou FALHA
+        └── _cleanup_temp_files()            ← limpa data/ ao final
 ```
 
-### Module responsibilities
+### Responsabilidades por Módulo
 
-| Module | Role |
-|---|---|
-| `crawler.py` | Discovers latest snapshot via WebDAV PROPFIND on Receita Federal; HTML fallback on `casadosdados.com.br` mirror |
-| `downloader.py` | Parallel HTTP download with resume (`Range` header), per-thread sessions, exponential back-off via tenacity |
-| `extractor.py` | Unzips to `data/extracted/`; validates with `zipfile.testzip()` |
-| `processor.py` | Reads raw RF CSVs (latin-1, `;` separator, no headers), applies `SCHEMAS`, normalises dates/decimals, writes to `data/processed/` |
-| `storage.py` | Pluggable writer: `CsvWriter` or `ParquetWriter` (controlled by `STORAGE_BACKEND` in config) |
-| `sync.py` | `CNPJSync` class orchestrates pipeline → SQL Server load; handles chunked reads with `CSV_CHUNK_ROWS` |
-| `database.py` | All pyodbc SQL Server operations: schema init, `bulk_upsert_*` methods, `controle_sincronizacao` tracking |
-| `pipeline.py` | `run_pipeline()` — wires crawler + downloader + extractor + processor into staged parallel execution |
-| `models.py` | Pydantic v2 models: `RemoteFile`, `Snapshot`, `DownloadResult`, `ExtractionResult`, `ProcessingResult`, `PipelineRun` |
-| `config.py` | All tuneable constants (workers, chunk sizes, URLs, schemas, column definitions) |
-| `logger_enhanced.py` | Loguru-based structured logger with correlation IDs; writes per-operation log files under `logs/` |
+| Módulo | Classe principal | Papel |
+|---|---|---|
+| `main.py` | `CNPJSyncApplication` | Entrypoint, leitura de env vars, ciclo de vida |
+| `src/crawler.py` | `SnapshotCrawler` | Descoberta de snapshot via WebDAV PROPFIND; fallback HTML |
+| `src/downloader.py` | `FileDownloader` | Download paralelo com resume (`Range`), retry exponencial (tenacity) |
+| `src/extractor.py` | `ZipExtractor` | Extração de ZIPs; valida com `zipfile.testzip()` |
+| `src/processor.py` | `CSVProcessor` | Lê CSVs latin-1 com `;`, aplica `SCHEMAS`, normaliza datas/decimais, grava em `data/processed/` |
+| `src/storage.py` | `CsvWriter`, `ParquetWriter` | Writers plugáveis controlados por `STORAGE_BACKEND` |
+| `src/pipeline.py` | `CNPJPipeline` | Orquestra crawler + downloader + extractor + processor em estágios paralelos |
+| `src/sync.py` | `CNPJSync`, `ProcessedFileReader`, `DataFrameNormalizer` | Lê artefatos processados e dispara carga no banco por grupo |
+| `src/database.py` | `CNPJDatabase` | Todas as operações PostgreSQL: schema, `bulk_upsert_*` via COPY FROM STDIN, controle de sessão |
+| `src/models.py` | Pydantic v2 | `RemoteFile`, `Snapshot`, `DownloadResult`, `ExtractionResult`, `ProcessingResult`, `PipelineRun` |
+| `src/config.py` | — | Todas as constantes (workers, chunks, URLs, schemas de colunas) |
+| `src/logger_enhanced.py` | — | Logger Loguru com IDs de correlação; grava em `logs/` |
 
-### Data model
+### Modelo de Dados
 
-`SCHEMAS` in `config.py` defines column lists for every group (files have no headers). Groups: `Empresas`, `Estabelecimentos`, `Socios`, `Simples` (partitioned, multi-file) + 6 small reference tables (`Cnaes`, `Motivos`, `Municipios`, `Naturezas`, `Paises`, `Qualificacoes`).
+`SCHEMAS` em `config.py` define as colunas de cada grupo (os CSVs da RF não têm cabeçalho).
 
-SQL schema is in `sql/schema.sql` (idempotent). Two control tables track runs: `cnpj.controle_sincronizacao` (per snapshot) and `cnpj.controle_arquivos` (per file).
+Grupos particionados (múltiplos arquivos): `Empresas`, `Estabelecimentos`, `Socios`  
+Arquivos de referência (arquivo único): `Cnaes`, `Motivos`, `Municipios`, `Naturezas`, `Paises`, `Qualificacoes`  
+Grupo especial (arquivo único): `Simples`
 
-### Key configuration knobs (`src/config.py`)
+### Carga no Banco
+
+Todos os grupos passam pelo mesmo padrão:
+
+1. `ProcessedFileReader` lê parquet/CSV em chunks
+2. Função de preparação converte tipos, trata nulos e trunca strings ao limite da coluna
+3. `_df_to_copy_buffer()` serializa para formato `COPY TEXT` (tab-delimited, `\N` para NULL)
+4. `COPY tmp_* FROM STDIN` carrega na tabela temporária (all-TEXT)
+5. `INSERT … ON CONFLICT … DO UPDATE` faz upsert tipado na tabela final
+
+### Tratamento de Nulos
+
+A constante modular `_NULL_STRS` em `database.py` define todas as strings que representam valores nulos (`"nan"`, `"NaN"`, `"None"`, `"NULL"`, `"<NA>"`, `"na"`, `"NA"`, `"N/A"`, etc.). Três camadas de proteção:
+
+1. Lambda `apply` em cada função de preparação checa `v in _NULL_STRS`
+2. `staged.replace(list(_NULL_STRS), None)` ao final de cada preparação
+3. `_df_to_copy_buffer` detecta `None`, `float NaN`, string vazia e `_NULL_STRS` → emite `\N`
+
+### Knobs de Configuração (`src/config.py`)
 
 ```python
-DOWNLOAD_WORKERS = 12      # HTTP threads (network-bound)
-EXTRACT_WORKERS  = 4       # ZIP extraction (disk-bound)
-PROCESS_WORKERS  = 4       # CSV normalisation (CPU-bound)
-DATABASE_WORKERS = 2       # SQL Server bulk load
-CSV_CHUNK_ROWS   = 200_000 # pandas chunk size (tune for memory)
-STORAGE_BACKEND  = "parquet"  # "csv" or "parquet"
+DOWNLOAD_WORKERS = 12      # threads HTTP (network-bound)
+EXTRACT_WORKERS  = 4       # threads de extração (disk-bound)
+PROCESS_WORKERS  = 4       # threads de normalização CSV (CPU-bound)
+CSV_CHUNK_ROWS   = 200_000 # chunk pandas (controle de memória)
+STORAGE_BACKEND  = "parquet"  # "csv" ou "parquet"
+REQUEST_TIMEOUT  = 120     # timeout HTTP em segundos
+MAX_RETRIES      = 5       # tentativas de download
 ```
 
-### `.env` variables
+### Variáveis de Ambiente
 
-```
-DB_SERVER    SQL Server host
-DB_DATABASE  Database name
-DB_USERNAME  Login
-DB_PASSWORD  Password
-```
+| Variável | Padrão | Descrição |
+|---|---|---|
+| `DB_SERVER` | `72.60.4.227` | Host PostgreSQL |
+| `DB_DATABASE` | `sandbox` | Nome do banco |
+| `DB_USERNAME` | — | Usuário (ou `POSTGRES_USER`) |
+| `DB_PASSWORD` | — | Senha (ou `POSTGRES_PASSWORD`) |
+| `DATABASE_URL` | — | URL completa — tem prioridade sobre as individuais |
+| `LOG_LEVEL` | `INFO` | `DEBUG \| INFO \| WARNING \| ERROR` |
+| `FORCE_SYNC` | `false` | `true` → ignora idempotência e reprocessa |
+| `REUSE_PROCESSED` | `true` | `true` → reutiliza `data/processed/` |
+| `SNAPSHOT_DATE` | vazio | `YYYY-MM` ou `YYYY-MM-DD`; vazio = mais recente |
+
+## Convenções Importantes
+
+- **Sem CLI flags**: toda configuração via variáveis de ambiente ou `.env`
+- **Idempotência**: a tabela `cnpj.controle_sincronizacao` impede dupla carga do mesmo snapshot; use `FORCE_SYNC=true` para forçar
+- **Reuse**: com `REUSE_PROCESSED=true`, só o banco é recarregado se os arquivos em `data/processed/` já existirem
+- **Encoding**: CSVs da RF são latin-1 com separador `;` sem cabeçalho
+- **Null bytes**: strings vindas dos CSVs podem conter `\x00` — são removidos em `_df_to_copy_buffer`
+- **Schema**: criado via `sql/schema.sql` (idempotente, `CREATE TABLE IF NOT EXISTS`)

@@ -41,7 +41,7 @@ from src.config import (
     TOTAL_DOWNLOAD_WORKERS,
     TOTAL_PROCESS_WORKERS,
 )
-from src.crawler import SnapshotCrawler, discover_latest_snapshot_with_fallback
+from src.crawler import SnapshotCrawler
 from src.downloader import FileDownloader, download_file, download_all
 from src.extractor import ZipExtractor, extract_zip, extract_all
 from src.logger_enhanced import logger, structured_logger
@@ -57,6 +57,10 @@ def _processed_output_path(remote_file: RemoteFile, output_dir: Path = PROCESSED
     return output_dir / f"{remote_file.stem}{output_extension(STORAGE_BACKEND)}"
 
 
+def _snapshot_stage_dir(base_dir: Path, snapshot_label: str) -> Path:
+    return base_dir / snapshot_label
+
+
 def _count_processed_rows(path: Path) -> int:
     if not path.exists():
         return 0
@@ -68,12 +72,16 @@ def _count_processed_rows(path: Path) -> int:
     return 0
 
 
-def _reused_processed_result(remote_file: RemoteFile, output_dir: Path = PROCESSED_DIR) -> ProcessingResult | None:
+def _reused_processed_result(
+    remote_file: RemoteFile,
+    output_dir: Path = PROCESSED_DIR,
+    download_dir: Path = DOWNLOADS_DIR,
+) -> ProcessingResult | None:
     output_path = _processed_output_path(remote_file, output_dir)
     if not output_path.exists():
         return None
 
-    local_zip = DOWNLOADS_DIR / remote_file.name
+    local_zip = download_dir / remote_file.name
     download_result = DownloadResult(
         remote_file=remote_file,
         local_path=local_zip,
@@ -153,9 +161,22 @@ class CNPJPipeline:
 
         try:
             if snapshot is None:
-                snapshot = self.crawler.discover_latest_snapshot_with_fallback(session=session)
+                if snapshot_date:
+                    snapshot = self.crawler.discover_snapshot_with_fallback(snapshot_date, session=session)
+                else:
+                    snapshot = self.crawler.discover_latest_snapshot_with_fallback(session=session)
             run.snapshot_date = snapshot.date
             files = snapshot.files
+
+            download_dir = _snapshot_stage_dir(DOWNLOADS_DIR, snapshot.date)
+            extracted_dir = _snapshot_stage_dir(EXTRACTED_DIR, snapshot.date)
+            processed_dir = _snapshot_stage_dir(PROCESSED_DIR, snapshot.date)
+            for path in (download_dir, extracted_dir, processed_dir):
+                path.mkdir(parents=True, exist_ok=True)
+
+            self.downloader.dest_dir = download_dir
+            self.extractor.dest_dir = extracted_dir
+            self.processor.output_dir = processed_dir
 
             if reference_only:
                 files = [f for f in files if f.group in REFERENCE_FILES]
@@ -174,7 +195,11 @@ class CNPJPipeline:
                 reused_count = 0
                 pending_files: list[RemoteFile] = []
                 for remote_file in files:
-                    reused = _reused_processed_result(remote_file, PROCESSED_DIR)
+                    reused = _reused_processed_result(
+                        remote_file,
+                        output_dir=processed_dir,
+                        download_dir=download_dir,
+                    )
                     if reused is None:
                         pending_files.append(remote_file)
                         continue
