@@ -53,7 +53,7 @@ BACKOFF_FACTOR: Final[float] = 2.0        # exponential back-off multiplier
 HEADERS: Final[dict[str, str]] = {
     "User-Agent": (
         "Mozilla/5.0 (compatible; RFCNPJScraper/1.0; "
-        "+https://github.com/yourorg/raspagem-empresas)"
+        "+https://github.com/joaoauvs/cnpj-sync-service)"
     ),
     "Accept-Encoding": "gzip, deflate",
 }
@@ -79,6 +79,7 @@ TOTAL_PROCESS_WORKERS: Final[int] = max(EXTRACT_WORKERS, PROCESS_WORKERS)  # whi
 CSV_ENCODING: Final[str] = "latin-1"   # RF files use ISO-8859-1
 CSV_SEPARATOR: Final[str] = ";"
 CSV_CHUNK_ROWS: Final[int] = 200_000   # rows per pandas chunk (memory control)
+DB_CHUNK_ROWS: Final[int] = 50_000     # rows per COPY FROM STDIN batch (database load)
 
 # Storage backend configuration
 STORAGE_BACKEND: Final[str] = "parquet"  # Options: "csv" or "parquet"

@@ -24,9 +24,10 @@ import psycopg2
 import psycopg2.extensions
 from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 
+from src.config import DB_CHUNK_ROWS
 from src.logger_enhanced import logger, structured_logger
 
-_CHUNK_SIZE = 50_000
+_CHUNK_SIZE = DB_CHUNK_ROWS
 
 # Strings que representam valores nulos vindos do pandas/parquet
 _NULL_STRS: frozenset[str] = frozenset({
@@ -45,7 +46,7 @@ class PostgreSQLConnection:
     def __init__(
         self,
         host: str = "localhost",
-        port: int = 5432,
+        port: Optional[int] = None,
         database: str = "postgres",
         username: Optional[str] = None,
         password: Optional[str] = None,
@@ -53,7 +54,7 @@ class PostgreSQLConnection:
         database_url: Optional[str] = None,
     ):
         self.host = host
-        self.port = port
+        self.port = port or int(os.getenv("DB_PORT", "5432"))
         self.database = database
         self.schema = schema
         self.username = username or os.getenv("DB_USERNAME") or os.getenv("POSTGRES_USER")
@@ -129,7 +130,7 @@ class CNPJDatabase(PostgreSQLConnection):
         database: str = "postgres",
         server: Optional[str] = None,
         host: str = "localhost",
-        port: int = 5432,
+        port: Optional[int] = None,
         username: Optional[str] = None,
         password: Optional[str] = None,
         **kwargs,
@@ -417,6 +418,55 @@ class CNPJDatabase(PostgreSQLConnection):
             return True
         except Exception as e:
             logger.error("Erro ao atualizar arquivo {}: {}", file_id, e)
+            return False
+
+    def get_downloaded_files(self, snapshot_date: date) -> dict[str, str]:
+        """Retorna {nome_arquivo: caminho_local} dos arquivos já baixados para este snapshot."""
+        try:
+            rows = self.execute_query(
+                f"SELECT nome_arquivo, COALESCE(caminho_local, '') "
+                f"FROM {self.schema}.controle_downloads "
+                "WHERE snapshot_date = %s AND status = 'BAIXADO'",
+                (str(snapshot_date),),
+            )
+            return {row[0]: row[1] for row in rows} if rows else {}
+        except Exception as e:
+            logger.error("Erro ao obter downloads registrados: {}", e)
+            return {}
+
+    def register_download(
+        self,
+        snapshot_date: date,
+        filename: str,
+        group: str,
+        status: str,
+        size_bytes: Optional[int] = None,
+        local_path: Optional[str] = None,
+        error: Optional[str] = None,
+    ) -> bool:
+        """Grava ou atualiza o status de download de um arquivo (upsert por snapshot+nome)."""
+        try:
+            with self.connect() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    f"""
+                    INSERT INTO {self.schema}.controle_downloads
+                        (snapshot_date, nome_arquivo, grupo_arquivo, status,
+                         tamanho_bytes, caminho_local, data_inicio, data_fim, erro_mensagem)
+                    VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW(), %s)
+                    ON CONFLICT (snapshot_date, nome_arquivo) DO UPDATE SET
+                        status        = EXCLUDED.status,
+                        tamanho_bytes = COALESCE(EXCLUDED.tamanho_bytes, controle_downloads.tamanho_bytes),
+                        caminho_local = COALESCE(EXCLUDED.caminho_local, controle_downloads.caminho_local),
+                        data_fim      = NOW(),
+                        erro_mensagem = EXCLUDED.erro_mensagem
+                    """,
+                    (str(snapshot_date), filename, group, status, size_bytes, local_path,
+                     str(error)[:2000] if error else None),
+                )
+            return True
+        except Exception as e:
+            logger.error("Erro ao registrar download de {}: {}", filename, e)
             return False
 
     def get_successfully_loaded_files(self, snapshot_date: date) -> dict:

@@ -24,9 +24,8 @@ from src.config import CSV_CHUNK_ROWS, CSV_ENCODING, CSV_SEPARATOR, DATE_COLUMNS
 from src.crawler import SnapshotCrawler
 from src.database import CNPJDatabase
 from src.logger_enhanced import logger, structured_logger
-from src.models import RemoteFile, Snapshot
+from src.models import FileStatus, RemoteFile, Snapshot
 from src.pipeline import CNPJPipeline, run_pipeline
-
 class DataFrameNormalizer:
     """Serviço de normalização aplicado antes da carga no banco."""
 
@@ -428,6 +427,22 @@ class CNPJSync:
         _session = self.snapshot_crawler.create_session()
         _session.auth = RF_AUTH
         try:
+            # Pré-verificação barata: apenas 1 PROPFIND na raiz para obter a data do snapshot.
+            # Evita listar arquivos e baixar dados quando o snapshot já está no banco.
+            # Só aplicável quando nenhuma data específica foi solicitada.
+            if not force and not requested_snapshot_ref:
+                try:
+                    peek_date_str = self.snapshot_crawler.get_latest_snapshot_date(_session)
+                    peek_canonical = self._canonical_snapshot_date(peek_date_str)
+                    needs, msg = self.check_snapshot_needs_sync(peek_canonical)
+                    if not needs:
+                        logger.info("{}", msg)
+                        return {"success": True, "skipped": True, "message": msg, "snapshot_date": str(peek_canonical)}
+                    logger.debug("Pré-verificação: snapshot {} é novo — prosseguindo com descoberta completa", peek_date_str)
+                except Exception as peek_exc:
+                    logger.warning("Pré-verificação do snapshot falhou: {} — continuando com descoberta completa", peek_exc)
+
+            # Descoberta completa: PROPFIND na pasta do snapshot (lista arquivos + tamanhos)
             if requested_snapshot_ref:
                 snapshot_obj = self.snapshot_crawler.discover_snapshot_with_fallback(
                     requested_snapshot_ref,
@@ -449,7 +464,7 @@ class CNPJSync:
 
         logger.info("=== INÍCIO SINCRONIZAÇÃO snapshot={} ===", snapshot_obj.date)
 
-        # Verificação de idempotência
+        # Verificação de idempotência (safety net para snapshot_ref explícito e fallback do peek)
         if not force:
             needs, msg = self.check_snapshot_needs_sync(snapshot_date)
             if not needs:
@@ -468,7 +483,26 @@ class CNPJSync:
         loaded_groups: set[str] = set()
 
         try:
-            # 1. Executar pipeline com o snapshot já descoberto (sem nova chamada ao crawler)
+            # Consulta banco ANTES do pipeline para evitar downloads desnecessários
+            already_db_loaded = self.db.get_successfully_loaded_files(snapshot_date)
+            already_downloaded = self.db.get_downloaded_files(snapshot_date)
+
+            if already_db_loaded:
+                logger.info(
+                    "{} arquivo(s) já carregados no banco — excluídos do download",
+                    len(already_db_loaded),
+                )
+                total_records += sum(already_db_loaded.values())
+                successful_files += len(already_db_loaded)
+
+            pending_download = {f for f in already_downloaded if f not in already_db_loaded}
+            if pending_download:
+                logger.info(
+                    "{} arquivo(s) já baixados anteriormente — download ignorado, apenas carga no banco",
+                    len(pending_download),
+                )
+
+            # 1. Executar pipeline excluindo arquivos já carregados no banco
             pipeline_result = self.pipeline.run(
                 groups=groups,
                 snapshot_date=str(snapshot_date),
@@ -479,26 +513,40 @@ class CNPJSync:
                 reference_only=reference_only,
                 snapshot=snapshot_obj,
                 reuse_processed=reuse_processed,
+                skip_files=set(already_db_loaded.keys()),
             )
 
-            total_files = len(pipeline_result.results)
+            total_files = len(pipeline_result.results) + len(already_db_loaded)
 
-            # Arquivos já carregados com sucesso em execuções anteriores deste snapshot
-            already_loaded = self.db.get_successfully_loaded_files(snapshot_date)
-            if already_loaded:
-                logger.info("{} arquivo(s) já carregados anteriormente, serão pulados", len(already_loaded))
-
-            # 2. Carregar cada arquivo processado no PostgreSQL
+            # 2. Processar resultados: registrar download e carregar no banco
             for pr in pipeline_result.results:
                 remote_file = pr.extraction_result.download_result.remote_file
                 filename = remote_file.name
                 group = remote_file.group
+                dl = pr.extraction_result.download_result
 
-                if filename in already_loaded:
-                    logger.info("Arquivo {} já carregado (SUCESSO anterior), pulando", filename)
-                    total_records += already_loaded[filename]
-                    successful_files += 1
-                    continue
+                # Registra status do download no controle_downloads
+                if dl.status in (FileStatus.DOWNLOADED, FileStatus.SKIPPED):
+                    local = dl.local_path
+                    zip_size = dl.bytes_downloaded or (
+                        local.stat().st_size if local and local.exists() else None
+                    )
+                    self.db.register_download(
+                        snapshot_date=snapshot_date,
+                        filename=filename,
+                        group=group,
+                        status="BAIXADO",
+                        size_bytes=zip_size,
+                        local_path=str(local) if local else None,
+                    )
+                elif dl.status == FileStatus.FAILED:
+                    self.db.register_download(
+                        snapshot_date=snapshot_date,
+                        filename=filename,
+                        group=group,
+                        status="FALHA",
+                        error=dl.error,
+                    )
 
                 self._register_file(remote_file)
 

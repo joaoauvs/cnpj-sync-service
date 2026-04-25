@@ -147,6 +147,7 @@ class CNPJPipeline:
         reference_only: bool = False,
         snapshot: Optional["Snapshot"] = None,
         reuse_processed: bool = False,
+        skip_files: Optional[set[str]] = None,
     ) -> PipelineRun:
         run = PipelineRun(
             snapshot_date=snapshot_date or "latest",
@@ -185,6 +186,16 @@ class CNPJPipeline:
                 groups_set = {g.lower() for g in groups}
                 files = [f for f in files if f.group.lower() in groups_set]
                 logger.info("Group filter {}: {} files selected", groups, len(files))
+
+            if skip_files:
+                before = len(files)
+                files = [f for f in files if f.name not in skip_files]
+                excluded = before - len(files)
+                if excluded:
+                    logger.info(
+                        "{} arquivo(s) excluídos do pipeline (já carregados no banco)",
+                        excluded,
+                    )
 
             if not files:
                 logger.warning("No files match the current filter — nothing to do")
@@ -318,6 +329,7 @@ def run_pipeline(
     reference_only: bool = False,
     snapshot: Optional["Snapshot"] = None,
     reuse_processed: bool = False,
+    skip_files: Optional[set[str]] = None,
 ) -> PipelineRun:
     """Compatibilidade pública com a API funcional anterior."""
     return CNPJPipeline().run(
@@ -330,6 +342,7 @@ def run_pipeline(
         reference_only=reference_only,
         snapshot=snapshot,
         reuse_processed=reuse_processed,
+        skip_files=skip_files,
     )
 
 

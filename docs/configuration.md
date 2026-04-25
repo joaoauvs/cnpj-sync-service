@@ -5,8 +5,8 @@
 | Variável | Padrão | Descrição |
 |---|---|---|
 | `DATABASE_URL` | — | URL completa PostgreSQL — tem prioridade sobre as variáveis individuais abaixo |
-| `DB_SERVER` | `72.60.4.227` | Host do PostgreSQL |
-| `DB_DATABASE` | `sandbox` | Nome do banco de dados |
+| `DB_SERVER` | `localhost` | Host do PostgreSQL |
+| `DB_DATABASE` | `postgres` | Nome do banco de dados |
 | `DB_USERNAME` | — | Usuário PostgreSQL (alias: `POSTGRES_USER`) |
 | `DB_PASSWORD` | — | Senha PostgreSQL (alias: `POSTGRES_PASSWORD`) |
 | `LOG_LEVEL` | `INFO` | Nível de log: `DEBUG`, `INFO`, `WARNING`, `ERROR` |

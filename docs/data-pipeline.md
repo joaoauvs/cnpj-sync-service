@@ -16,7 +16,7 @@ Os dados são publicados mensalmente pela Receita Federal no formato de ZIPs con
 | Grupo | Arquivos | Linhas (aprox.) |
 |---|---|---|
 | `Empresas` | Empresas0.zip … EmpresasN.zip | ~60 M |
-| `Estabelecimentos` | Estabelecimentos0.zip … | ~62 M |
+| `Estabelecimentos` | Estabelecimentos0.zip … | ~71 M |
 | `Socios` | Socios0.zip … | ~25 M |
 
 ### Arquivo único
@@ -45,7 +45,8 @@ Valores inválidos ou `00000000` → string vazia → NULL no banco.
 
 ### Decimais (`DECIMAL_COLUMNS`)
 
-- `Empresas.capital_social`: vírgula brasileira → ponto (`1.234,56` → `1234.56`) → `float`
+- `Empresas.capital_social`: vírgula decimal → ponto (`1234,56` → `1234.56`) → `float`  
+  A RF não usa separador de milhar — o código substitui apenas vírgula por ponto via `str.replace(",", ".")`.
 
 ### Nulos
 

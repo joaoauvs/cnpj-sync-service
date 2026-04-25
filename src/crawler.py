@@ -346,6 +346,28 @@ class SnapshotCrawler:
     def discover_fallback_snapshot_for(self, snapshot_ref: str, session: requests.Session) -> Snapshot:
         return _discover_html(session, self.fallback_base_url, requested_snapshot=snapshot_ref)
 
+    def get_latest_snapshot_date(self, session: requests.Session) -> str:
+        """Descobre apenas a data do snapshot mais recente (1 PROPFIND na raiz, sem listar arquivos).
+
+        Usado como pré-verificação barata antes de decidir se o sync é necessário.
+        """
+        try:
+            dirs = _webdav_snapshot_dirs(session)
+            return _select_snapshot_dir(dirs)
+        except Exception as exc:
+            logger.warning("WebDAV RF: falha no peek da data ({}), tentando fallback HTML", exc)
+            html = _fetch_html(self.fallback_base_url, session)
+            soup = BeautifulSoup(html, "lxml")
+            dated_dirs = [
+                a["href"].rstrip("/").split("/")[-1]
+                for a in soup.find_all("a", href=True)
+                if _YYYY_MM_DD.match(a["href"].rstrip("/").split("/")[-1])
+                   or _YYYY_MM.match(a["href"].rstrip("/").split("/")[-1])
+            ]
+            if not dated_dirs:
+                raise RuntimeError("Não foi possível descobrir a data do snapshot via fallback HTML")
+            return _select_snapshot_dir(dated_dirs)
+
     def discover_latest_snapshot_with_fallback(
         self,
         session: Optional[requests.Session] = None,

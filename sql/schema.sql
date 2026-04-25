@@ -253,3 +253,142 @@ CREATE TABLE IF NOT EXISTS cnpj.controle_arquivos (
 
 CREATE INDEX IF NOT EXISTS ix_arq_execucao
     ON cnpj.controle_arquivos (id_execucao, status);
+
+-- ---------------------------------------------------------------------------
+-- controle_downloads: rastreia o download individual de cada ZIP por snapshot.
+-- Chave natural: (snapshot_date, nome_arquivo) — persiste entre execuções,
+-- permitindo que a próxima run saiba que o arquivo já foi baixado sem precisar
+-- verificar o filesystem ou re-baixar.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS cnpj.controle_downloads (
+    id            BIGSERIAL    NOT NULL,
+    snapshot_date DATE         NOT NULL,
+    nome_arquivo  VARCHAR(255) NOT NULL,
+    grupo_arquivo VARCHAR(50)  NOT NULL,
+    status        VARCHAR(20)  NOT NULL DEFAULT 'PENDENTE'
+        CONSTRAINT chk_dl_status CHECK (
+            status IN ('PENDENTE', 'BAIXANDO', 'BAIXADO', 'FALHA')
+        ),
+    tamanho_bytes BIGINT       NULL,
+    caminho_local TEXT         NULL,
+    data_inicio   TIMESTAMP    NOT NULL DEFAULT NOW(),
+    data_fim      TIMESTAMP    NULL,
+    erro_mensagem TEXT         NULL,
+    CONSTRAINT pk_controle_downloads PRIMARY KEY (id),
+    CONSTRAINT uq_controle_downloads UNIQUE (snapshot_date, nome_arquivo)
+);
+
+CREATE INDEX IF NOT EXISTS ix_dl_snapshot_status
+    ON cnpj.controle_downloads (snapshot_date, status)
+    INCLUDE (nome_arquivo, caminho_local);
+
+-- =============================================================================
+-- VIEWS
+-- =============================================================================
+
+CREATE OR REPLACE VIEW cnpj.vw_empresas_completo AS
+SELECT
+    -- CNPJ completo (14 dígitos) e formatado (XX.XXX.XXX/XXXX-XX)
+    est.cnpj_completo,
+    SUBSTRING(est.cnpj_completo, 1, 2) || '.' ||
+    SUBSTRING(est.cnpj_completo, 3, 3) || '.' ||
+    SUBSTRING(est.cnpj_completo, 6, 3) || '/' ||
+    SUBSTRING(est.cnpj_completo, 9, 4) || '-' ||
+    SUBSTRING(est.cnpj_completo, 13, 2)          AS cnpj_formatado,
+    est.cnpj_basico,
+    est.cnpj_ordem,
+    est.cnpj_dv,
+
+    -- Dados da empresa
+    emp.razao_social,
+    emp.natureza_juridica,
+    nat.descricao                                 AS natureza_juridica_descricao,
+    emp.qualificacao_responsavel,
+    qual.descricao                                AS qualificacao_responsavel_descricao,
+    emp.capital_social,
+    emp.porte_empresa,
+    CASE emp.porte_empresa
+        WHEN '00' THEN 'Não Informado'
+        WHEN '01' THEN 'Micro Empresa'
+        WHEN '03' THEN 'Empresa de Pequeno Porte'
+        WHEN '05' THEN 'Demais'
+        ELSE emp.porte_empresa
+    END                                           AS porte_empresa_descricao,
+    emp.ente_federativo_responsavel,
+
+    -- Dados do estabelecimento
+    est.identificador_matriz_filial,
+    CASE est.identificador_matriz_filial
+        WHEN '1' THEN 'Matriz'
+        WHEN '2' THEN 'Filial'
+        ELSE 'Desconhecido'
+    END                                           AS tipo_unidade,
+    est.nome_fantasia,
+    est.situacao_cadastral,
+    CASE est.situacao_cadastral
+        WHEN '01' THEN 'Nula'
+        WHEN '02' THEN 'Ativa'
+        WHEN '03' THEN 'Suspensa'
+        WHEN '04' THEN 'Inapta'
+        WHEN '08' THEN 'Baixada'
+        ELSE est.situacao_cadastral
+    END                                           AS situacao_cadastral_descricao,
+    est.data_situacao_cadastral,
+    est.motivo_situacao_cadastral,
+    mot.descricao                                 AS motivo_situacao_cadastral_descricao,
+    est.data_inicio_atividade,
+
+    -- Atividade econômica
+    est.cnae_fiscal,
+    cnae.descricao                                AS cnae_fiscal_descricao,
+    est.cnae_fiscal_secundaria,
+
+    -- Endereço
+    est.tipo_logradouro,
+    est.logradouro,
+    est.numero,
+    est.complemento,
+    est.bairro,
+    est.cep,
+    est.uf,
+    est.municipio,
+    mun.descricao                                 AS municipio_descricao,
+    est.nome_cidade_exterior,
+    est.pais,
+    pais.descricao                                AS pais_descricao,
+
+    -- Contato
+    est.ddd_1,
+    est.telefone_1,
+    est.ddd_2,
+    est.telefone_2,
+    est.ddd_fax,
+    est.fax,
+    est.correio_eletronico,
+
+    -- Situação especial
+    est.situacao_especial,
+    est.data_situacao_especial,
+
+    -- Simples Nacional / MEI
+    sim.opcao_pelo_simples,
+    sim.data_opcao_simples,
+    sim.data_exclusao_simples,
+    sim.opcao_mei,
+    sim.data_opcao_mei,
+    sim.data_exclusao_mei,
+
+    -- Metadados
+    est.snapshot_date,
+    est.data_carga
+
+FROM cnpj.estabelecimentos est
+LEFT JOIN cnpj.empresas      emp  ON emp.cnpj_basico = est.cnpj_basico
+LEFT JOIN cnpj.naturezas     nat  ON nat.codigo       = emp.natureza_juridica
+LEFT JOIN cnpj.qualificacoes qual ON qual.codigo      = emp.qualificacao_responsavel
+LEFT JOIN cnpj.motivos       mot  ON mot.codigo       = est.motivo_situacao_cadastral
+LEFT JOIN cnpj.cnaes         cnae ON cnae.codigo      = est.cnae_fiscal
+LEFT JOIN cnpj.municipios    mun  ON mun.codigo       = est.municipio
+LEFT JOIN cnpj.paises        pais ON pais.codigo      = est.pais
+LEFT JOIN cnpj.simples       sim  ON sim.cnpj_basico  = est.cnpj_basico;

@@ -27,7 +27,14 @@ set LOG_LEVEL=DEBUG && python main.py
 
 > **Atenção**: o projeto usa variáveis de ambiente, não flags CLI. Não existe `--force`, `--date` ou `--workers`.
 
-Não há suite de testes nem configuração de linter no repositório.
+A suite de testes fica em `tests/` e usa `pytest`. Para rodar:
+
+```bash
+pip install -r requirements-dev.txt
+pytest                          # suite completa
+pytest tests/test_config.py tests/test_normalizer.py  # unitários (sem banco)
+pytest tests/test_connection.py tests/test_schema.py tests/test_view.py  # integração
+```
 
 ## Arquitetura
 
@@ -111,8 +118,8 @@ MAX_RETRIES      = 5       # tentativas de download
 
 | Variável | Padrão | Descrição |
 |---|---|---|
-| `DB_SERVER` | `72.60.4.227` | Host PostgreSQL |
-| `DB_DATABASE` | `sandbox` | Nome do banco |
+| `DB_SERVER` | `localhost` | Host PostgreSQL |
+| `DB_DATABASE` | `postgres` | Nome do banco |
 | `DB_USERNAME` | — | Usuário (ou `POSTGRES_USER`) |
 | `DB_PASSWORD` | — | Senha (ou `POSTGRES_PASSWORD`) |
 | `DATABASE_URL` | — | URL completa — tem prioridade sobre as individuais |

@@ -127,6 +127,22 @@ Aumentar verbosidade:
 LOG_LEVEL=DEBUG
 ```
 
+## Testes automatizados
+
+Para verificar conectividade, estrutura do banco e integridade dos dados:
+
+```bash
+pip install -r requirements-dev.txt
+
+pytest                          # suite completa
+pytest tests/test_connection.py # só conectividade
+pytest tests/test_schema.py     # só estrutura de tabelas e view
+pytest tests/test_view.py       # integridade de dados da view
+pytest tests/test_normalizer.py # normalização de datas/decimais (sem banco)
+```
+
+---
+
 ## Monitoramento de Progresso
 
 Via banco de dados:
@@ -147,4 +163,15 @@ SELECT
   SELECT 'estabelecimentos', COUNT(*) FROM cnpj.estabelecimentos   UNION ALL
   SELECT 'socios',           COUNT(*) FROM cnpj.socios             UNION ALL
   SELECT 'simples',          COUNT(*) FROM cnpj.simples;
+
+-- Consulta rápida via view (com CNPJ formatado e descrições)
+SELECT cnpj_formatado, razao_social, situacao_cadastral_descricao, municipio_descricao
+FROM cnpj.vw_empresas_completo
+WHERE cnpj_completo = '00000000000191';
+
+-- Estatísticas por situação cadastral via view
+SELECT situacao_cadastral_descricao, COUNT(*)
+FROM cnpj.vw_empresas_completo
+GROUP BY situacao_cadastral_descricao
+ORDER BY COUNT(*) DESC;
 ```

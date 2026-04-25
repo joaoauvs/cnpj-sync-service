@@ -50,43 +50,40 @@ def _local_path(remote_file: RemoteFile, base_dir: Path = DOWNLOADS_DIR) -> Path
 
 def _already_complete(path: Path, expected_bytes: Optional[int]) -> bool:
     """
-    Return True if the local file exists and its size matches the expected
-    size.
-
-    The directory-listing size is an approximation (e.g., "22K" can mean
-    anywhere from ~22000 to ~22528 bytes).  We therefore only skip when the
-    local file is within 5% of the reported size, or when we have an exact
-    server-reported byte count from a prior HEAD request stored separately.
+    Return True if the local file exists and its size matches the expected size.
+    Tolerates ±5% to account for rounded directory-listing sizes.
+    Returns False (not True) when expected_bytes is unknown — falls through to _valid_local_zip.
     """
     if not path.exists():
         return False
     if expected_bytes is None:
         return False
     actual = path.stat().st_size
-    # Tolerate ±5% to account for rounded directory-listing sizes
     return abs(actual - expected_bytes) / max(expected_bytes, 1) <= 0.05
 
 
 def _valid_local_zip(path: Path) -> bool:
     """
-    Return True if a local ZIP exists and passes an integrity check.
+    Return True if a local ZIP exists and has a readable central directory.
 
-    This lets us safely reuse already-downloaded files even when the remote
-    listing size is missing or rounded imprecisely.
+    Reads only the ZIP central directory (last few KB of file) — NOT the full
+    file contents. Avoids testzip() which reads and CRC-checks all compressed
+    data (500 MB+), causing multi-minute disk reads that appear as re-downloads.
+    Corrupted payload data is caught at extraction time.
     """
     if not path.exists() or path.stat().st_size == 0:
         return False
     try:
         with zipfile.ZipFile(path, "r") as zf:
-            if not zf.namelist():
-                return False
-            return zf.testzip() is None
-    except zipfile.BadZipFile:
+            return bool(zf.namelist())
+    except (zipfile.BadZipFile, Exception):
         return False
 
 
 @retry(
-    retry=retry_if_exception_type((requests.ConnectionError, requests.Timeout)),
+    retry=retry_if_exception_type(
+        (requests.ConnectionError, requests.Timeout, requests.exceptions.ChunkedEncodingError)
+    ),
     stop=stop_after_attempt(MAX_RETRIES),
     wait=wait_exponential(multiplier=BACKOFF_FACTOR, min=2, max=120),
     reraise=True,
@@ -107,8 +104,10 @@ def _download_file(
 
     if existing_bytes > 0:
         headers["Range"] = f"bytes={existing_bytes}-"
-        logger.debug(
-            "Resuming {} from byte {}", remote_file.name, existing_bytes
+        logger.info(
+            "Retomando {} a partir de {:.0f} MB já baixados",
+            remote_file.name,
+            existing_bytes / 1_024**2,
         )
 
     resp = session.get(

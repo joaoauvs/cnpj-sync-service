@@ -6,6 +6,7 @@ Configuração via .env:
     DATABASE_URL     URL completa PostgreSQL (opcional, tem prioridade)
                      Ex: postgresql://user:pass@host:5432/db
     DB_SERVER        Host do PostgreSQL      (padrão: localhost)
+    DB_PORT          Porta do PostgreSQL     (padrão: 5432)
     DB_DATABASE      Nome do banco           (padrão: postgres)
     DB_USERNAME      Usuário PostgreSQL
     DB_PASSWORD      Senha PostgreSQL
@@ -32,6 +33,7 @@ from src.config import DOWNLOAD_WORKERS, DOWNLOADS_DIR, EXTRACTED_DIR, PROCESS_W
 from src.logger_enhanced import logger, setup_enhanced_logging, structured_logger
 
 _DB_SERVER     = os.getenv("DB_SERVER", "localhost")
+_DB_PORT       = int(os.getenv("DB_PORT", "5432"))
 _DB_DATABASE   = os.getenv("DB_DATABASE", "postgres")
 _DB_USERNAME   = os.getenv("DB_USERNAME") or os.getenv("POSTGRES_USER")
 _DB_PASSWORD   = os.getenv("DB_PASSWORD") or os.getenv("POSTGRES_PASSWORD")
@@ -117,6 +119,7 @@ class CNPJSyncApplication:
     def __init__(
         self,
         server: str = _DB_SERVER,
+        port: int = _DB_PORT,
         database: str = _DB_DATABASE,
         username: Optional[str] = _DB_USERNAME,
         password: Optional[str] = _DB_PASSWORD,
@@ -128,6 +131,7 @@ class CNPJSyncApplication:
         process_workers: int = PROCESS_WORKERS,
     ) -> None:
         self.server = server
+        self.port = port
         self.database = database
         self.username = username
         self.password = password
@@ -143,6 +147,7 @@ class CNPJSyncApplication:
 
         return CNPJDatabase(
             server=self.server,
+            port=self.port,
             database=self.database,
             username=self.username,
             password=self.password,
@@ -203,6 +208,7 @@ class CNPJSyncApplication:
         return _log_total_execution_time(result, elapsed)
 
 
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Sincronização CNPJ com PostgreSQL")
     parser.add_argument("--force", action="store_true", default=_FORCE, help="Re-sincroniza mesmo se o snapshot já foi processado")
@@ -212,6 +218,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--download-workers", type=_positive_int, default=None, help="Workers de download")
     parser.add_argument("--process-workers", type=_positive_int, default=None, help="Workers de processamento")
     parser.add_argument("--server", default=_DB_SERVER, help="Host do PostgreSQL")
+    parser.add_argument("--port", type=int, default=_DB_PORT, help="Porta do PostgreSQL (padrão: 5432)")
     parser.add_argument("--database", default=_DB_DATABASE, help="Nome do banco PostgreSQL")
     parser.add_argument("--username", default=_DB_USERNAME, help="Usuário do banco")
     parser.add_argument("--password", default=_DB_PASSWORD, help="Senha do banco")
@@ -241,6 +248,7 @@ def main() -> None:
 
     app = CNPJSyncApplication(
         server=args.server,
+        port=args.port,
         database=args.database,
         username=args.username,
         password=args.password,
@@ -251,6 +259,7 @@ def main() -> None:
         download_workers=download_workers,
         process_workers=process_workers,
     )
+
     sys.exit(app.run())
 
 

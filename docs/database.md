@@ -72,7 +72,7 @@ snapshot_date               DATE           NOT NULL
 data_carga                  TIMESTAMP      NOT NULL DEFAULT NOW()
 ```
 
-~62 milhões de registros. Upsert por `cnpj_completo`.
+~71 milhões de registros. Upsert por `cnpj_completo`.
 
 #### `cnpj.socios`
 
@@ -169,6 +169,63 @@ WHERE snapshot_date = %s AND cnpj_basico = ANY(%s);
 -- INSERT em bloco
 INSERT INTO cnpj.socios (...) SELECT ... FROM tmp_socios_*;
 ```
+
+## View
+
+### `cnpj.vw_empresas_completo`
+
+View desnormalizada com join de todas as tabelas. Projetada para consultas analíticas e exportações.
+
+**Tabelas envolvidas:**
+
+| Tabela | Join | Propósito |
+|---|---|---|
+| `estabelecimentos` | base | CNPJ completo, endereço, contato, situação |
+| `empresas` | `LEFT JOIN cnpj_basico` | Razão social, capital, porte, natureza |
+| `naturezas` | `LEFT JOIN natureza_juridica` | Descrição da natureza jurídica |
+| `qualificacoes` | `LEFT JOIN qualificacao_responsavel` | Descrição da qualificação do responsável |
+| `motivos` | `LEFT JOIN motivo_situacao_cadastral` | Descrição do motivo de situação |
+| `cnaes` | `LEFT JOIN cnae_fiscal` | Descrição da atividade econômica principal |
+| `municipios` | `LEFT JOIN municipio` | Nome do município |
+| `paises` | `LEFT JOIN pais` | Nome do país (estabelecimentos no exterior) |
+| `simples` | `LEFT JOIN cnpj_basico` | Opção Simples Nacional / MEI |
+
+**Colunas principais:**
+
+```sql
+cnpj_completo          VARCHAR(14)   -- CNPJ sem formatação (14 dígitos)
+cnpj_formatado         TEXT          -- XX.XXX.XXX/XXXX-XX
+cnpj_basico            VARCHAR(8)
+razao_social           VARCHAR(150)
+natureza_juridica_descricao  TEXT
+porte_empresa_descricao      TEXT    -- 'Micro Empresa', 'EPP', 'Demais', etc.
+tipo_unidade                 TEXT    -- 'Matriz' ou 'Filial'
+situacao_cadastral_descricao TEXT    -- 'Ativa', 'Baixada', 'Inapta', etc.
+cnae_fiscal_descricao        TEXT
+municipio_descricao          TEXT
+opcao_pelo_simples     VARCHAR(1)
+opcao_mei              VARCHAR(1)
+```
+
+**Exemplo de uso:**
+
+```sql
+-- Empresas ativas em SP com CNAE de tecnologia
+SELECT cnpj_formatado, razao_social, municipio_descricao, cnae_fiscal_descricao
+FROM cnpj.vw_empresas_completo
+WHERE situacao_cadastral = '02'
+  AND uf = 'SP'
+  AND cnae_fiscal LIKE '62%'
+LIMIT 100;
+
+-- Contagem por situação
+SELECT situacao_cadastral_descricao, COUNT(*)
+FROM cnpj.vw_empresas_completo
+GROUP BY situacao_cadastral_descricao
+ORDER BY COUNT(*) DESC;
+```
+
+> **Atenção:** a view faz join de ~71 M linhas. Para queries de produção, adicione sempre filtros indexados (`cnpj_completo`, `cnpj_basico`, `uf`, `situacao_cadastral`, `cnae_fiscal`, `municipio`).
 
 ## Índices
 

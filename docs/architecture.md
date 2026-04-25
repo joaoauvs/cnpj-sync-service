@@ -55,7 +55,7 @@ CNPJSyncApplication (main.py)
   - Sem cabeçalho — colunas definidas por `SCHEMAS` em `config.py`
   - `dtype=str`, `na_values=[""]`, `keep_default_na=False`
 - Normaliza datas (`YYYYMMDD` → `YYYY-MM-DD`)
-- Normaliza decimais (`1.234,56` → `1234.56`)
+- Normaliza decimais (`1234,56` → `1234.56`) — RF usa vírgula como separador decimal sem separador de milhar
 - Grava em `data/processed/` como Parquet ou CSV
 
 ### 5. Carga (`CNPJDatabase`)
