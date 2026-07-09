@@ -29,7 +29,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from src.config import DOWNLOAD_WORKERS, DOWNLOADS_DIR, EXTRACTED_DIR, PROCESS_WORKERS, PROCESSED_DIR
+from src.config import DOWNLOAD_WORKERS, DOWNLOADS_DIR, EXTRACT_WORKERS, EXTRACTED_DIR, PROCESS_WORKERS, PROCESSED_DIR
 from src.logger_enhanced import logger, setup_enhanced_logging, structured_logger
 
 _DB_SERVER     = os.getenv("DB_SERVER", "localhost")
@@ -128,6 +128,7 @@ class CNPJSyncApplication:
         snapshot_date_raw: Optional[str] = _SNAPSHOT_DATE,
         reuse_processed_env: bool = _REUSE_PROCESSED,
         download_workers: int = DOWNLOAD_WORKERS,
+        extract_workers: int = EXTRACT_WORKERS,
         process_workers: int = PROCESS_WORKERS,
     ) -> None:
         self.server = server
@@ -140,6 +141,7 @@ class CNPJSyncApplication:
         self.snapshot_date_raw = snapshot_date_raw
         self.reuse_processed = reuse_processed_env and not force
         self.download_workers = download_workers
+        self.extract_workers = extract_workers
         self.process_workers = process_workers
 
     def create_database(self):
@@ -198,6 +200,7 @@ class CNPJSyncApplication:
             force_download=self.force,
             force_extract=self.force,
             download_workers=self.download_workers,
+            extract_workers=self.extract_workers,
             process_workers=self.process_workers,
             reference_only=False,
             force=self.force,
@@ -214,9 +217,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--force", action="store_true", default=_FORCE, help="Re-sincroniza mesmo se o snapshot já foi processado")
     parser.add_argument("--date", dest="snapshot_date_raw", default=_SNAPSHOT_DATE, help="Snapshot alvo em YYYY-MM ou YYYY-MM-DD")
     parser.add_argument("--log-level", default=_LOG_LEVEL, choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Nível de log")
-    parser.add_argument("--workers", type=_positive_int, help="Define o mesmo valor para download e processamento")
-    parser.add_argument("--download-workers", type=_positive_int, default=None, help="Workers de download")
-    parser.add_argument("--process-workers", type=_positive_int, default=None, help="Workers de processamento")
+    parser.add_argument("--workers", type=_positive_int, help="Define o mesmo valor para download, extração e processamento")
+    parser.add_argument("--workers-download", "--download-workers", dest="download_workers", type=_positive_int, default=None, help="Workers de download")
+    parser.add_argument("--workers-extract", "--extract-workers", dest="extract_workers", type=_positive_int, default=None, help="Workers de extração")
+    parser.add_argument("--workers-process", "--process-workers", dest="process_workers", type=_positive_int, default=None, help="Workers de processamento")
     parser.add_argument("--server", default=_DB_SERVER, help="Host do PostgreSQL")
     parser.add_argument("--port", type=int, default=_DB_PORT, help="Porta do PostgreSQL (padrão: 5432)")
     parser.add_argument("--database", default=_DB_DATABASE, help="Nome do banco PostgreSQL")
@@ -244,6 +248,7 @@ def main() -> None:
 
     shared_workers = args.workers
     download_workers = args.download_workers or shared_workers or DOWNLOAD_WORKERS
+    extract_workers = args.extract_workers or shared_workers or EXTRACT_WORKERS
     process_workers = args.process_workers or shared_workers or PROCESS_WORKERS
 
     app = CNPJSyncApplication(
@@ -257,6 +262,7 @@ def main() -> None:
         snapshot_date_raw=args.snapshot_date_raw,
         reuse_processed_env=args.reuse_processed,
         download_workers=download_workers,
+        extract_workers=extract_workers,
         process_workers=process_workers,
     )
 

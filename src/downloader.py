@@ -76,7 +76,7 @@ def _valid_local_zip(path: Path) -> bool:
     try:
         with zipfile.ZipFile(path, "r") as zf:
             return bool(zf.namelist())
-    except (zipfile.BadZipFile, Exception):
+    except Exception:
         return False
 
 
@@ -218,6 +218,14 @@ class FileDownloader:
             if expected and actual == 0:
                 raise ValueError(f"Downloaded file is empty: {remote_file.name}")
 
+            # Um ZIP truncado/corrompido só seria detectado na extração; validar
+            # aqui permite descartar o arquivo para que a próxima execução rebaixe.
+            if not _valid_local_zip(dest):
+                dest.unlink(missing_ok=True)
+                raise ValueError(
+                    f"ZIP inválido após download ({actual} bytes) — arquivo descartado: {remote_file.name}"
+                )
+
             speed = bytes_dl / elapsed / 1_024**2 if elapsed > 0 else 0
             structured_logger.debug(
                 "Downloaded {} in {:.1f}s ({:.1f} MB/s)",
@@ -233,8 +241,10 @@ class FileDownloader:
             return DownloadResult(
                 remote_file=remote_file,
                 local_path=dest,
+                # Tamanho total do arquivo em disco (em downloads retomados,
+                # bytes_dl cobre apenas o trecho baixado nesta chamada).
+                bytes_downloaded=actual,
                 status=FileStatus.DOWNLOADED,
-                bytes_downloaded=bytes_dl,
                 duration_seconds=elapsed,
             )
 

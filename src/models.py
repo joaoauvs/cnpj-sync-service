@@ -8,7 +8,7 @@ pipeline artefacts so they can be serialised/deserialised cleanly.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Optional
@@ -93,7 +93,7 @@ class PipelineRun(BaseModel):
     """Top-level summary of a full pipeline execution."""
 
     snapshot_date: str
-    started_at: datetime = Field(default_factory=datetime.utcnow)
+    started_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     finished_at: Optional[datetime] = None
     results: list[ProcessingResult] = Field(default_factory=list)
 

@@ -7,6 +7,7 @@ without touching business logic.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Final
 
@@ -30,8 +31,7 @@ for _d in (DOWNLOADS_DIR, EXTRACTED_DIR, PROCESSED_DIR, LOGS_DIR):
 
 # Receita Federal — WebDAV via Nextcloud (share público)
 # RF_SHARE_TOKEN é o token do share público da RF; pode ser sobrescrito via env var RF_SHARE_TOKEN
-import os as _os
-RF_SHARE_TOKEN: Final[str] = _os.getenv("RF_SHARE_TOKEN", "YggdBLfdninEJX9")
+RF_SHARE_TOKEN: Final[str] = os.getenv("RF_SHARE_TOKEN", "YggdBLfdninEJX9")
 RF_WEBDAV_BASE: Final[str] = "https://arquivos.receitafederal.gov.br/public.php/webdav"
 RF_AUTH: Final[tuple[str, str]] = (RF_SHARE_TOKEN, "")  # Basic Auth: (token, "")
 
