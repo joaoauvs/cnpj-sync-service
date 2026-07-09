@@ -20,12 +20,14 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 import pandas as pd
 import pyarrow.parquet as pq
 
-from src.config import CSV_CHUNK_ROWS, CSV_ENCODING, CSV_SEPARATOR, DATE_COLUMNS, DECIMAL_COLUMNS, HEADERS, RF_AUTH, SCHEMAS, STORAGE_BACKEND
+from src.config import CSV_CHUNK_ROWS, DATE_COLUMNS, DECIMAL_COLUMNS, EXTRACT_WORKERS, RF_AUTH, STORAGE_BACKEND
 from src.crawler import SnapshotCrawler
 from src.database import CNPJDatabase
-from src.logger_enhanced import logger, structured_logger
-from src.models import FileStatus, RemoteFile, Snapshot
-from src.pipeline import CNPJPipeline, run_pipeline
+from src.logger_enhanced import logger
+from src.models import FileStatus, RemoteFile
+from src.pipeline import CNPJPipeline
+
+
 class DataFrameNormalizer:
     """Serviço de normalização aplicado antes da carga no banco."""
 
@@ -406,6 +408,7 @@ class CNPJSync:
         force_download: bool = False,
         force_extract: bool = False,
         download_workers: int = 4,
+        extract_workers: int = EXTRACT_WORKERS,
         process_workers: int = 4,
         reference_only: bool = False,
         force: bool = False,
@@ -422,7 +425,6 @@ class CNPJSync:
           5. Atualiza controle_sincronizacao
           6. Remove arquivos temporários se sucesso
         """
-        import requests as _req
         requested_snapshot_ref = snapshot_date.isoformat() if snapshot_date else None
         _session = self.snapshot_crawler.create_session()
         _session.auth = RF_AUTH
@@ -509,6 +511,7 @@ class CNPJSync:
                 force_download=force_download,
                 force_extract=force_extract,
                 download_workers=download_workers,
+                extract_workers=extract_workers,
                 process_workers=process_workers,
                 reference_only=reference_only,
                 snapshot=snapshot_obj,
@@ -653,7 +656,7 @@ class CNPJSync:
                 f"SELECT id_execucao, snapshot_date, status, data_inicio_execucao, "
                 "data_fim_execucao, total_arquivos, arquivos_processados, arquivos_falha, "
                 "total_registros, duracao_segundos, erro_mensagem "
-                f"FROM {self.db.schema}.controle_sincronizacao WHERE id_execucao = ?",
+                f"FROM {self.db.schema}.controle_sincronizacao WHERE id_execucao = %s",
                 (exec_id,),
             )
             if not rows:
@@ -677,7 +680,7 @@ class CNPJSync:
             files = self.db.execute_query(
                 f"SELECT id_arquivo, grupo_arquivo, nome_arquivo, status, "
                 "data_inicio, data_fim, total_registros, registros_invalidos, erro_mensagem "
-                f"FROM {self.db.schema}.controle_arquivos WHERE id_execucao = ? "
+                f"FROM {self.db.schema}.controle_arquivos WHERE id_execucao = %s "
                 "ORDER BY data_inicio",
                 (exec_id,),
             )

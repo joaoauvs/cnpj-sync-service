@@ -70,8 +70,8 @@ python main.py --log-level DEBUG
 set LOG_LEVEL=DEBUG && python main.py
 
 # Ajustar paralelismo
-python main.py --workers 8                  # download + processamento
-python main.py --download-workers 12 --process-workers 4
+python main.py --workers 8                  # download + extração + processamento
+python main.py --workers-download 12 --workers-extract 4 --workers-process 4
 
 # Conexão ao banco via CLI
 python main.py --server host --database banco --username user --password senha
