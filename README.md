@@ -18,7 +18,7 @@ Descoberta de snapshot → Download paralelo → Extração → Processamento �
 
 ## Pré-requisitos
 
-- Python 3.11+
+- Python 3.14+
 - PostgreSQL 14+ acessível pela rede
 
 ## Instalação

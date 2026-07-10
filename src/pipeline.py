@@ -17,9 +17,8 @@ processing can overlap with ongoing downloads on large datasets.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Optional
 
 import pyarrow.parquet as pq
 
@@ -101,10 +100,10 @@ class CNPJPipeline:
 
     def __init__(
         self,
-        crawler: Optional[SnapshotCrawler] = None,
-        downloader: Optional[FileDownloader] = None,
-        extractor: Optional[ZipExtractor] = None,
-        processor: Optional[CSVProcessor] = None,
+        crawler: SnapshotCrawler | None = None,
+        downloader: FileDownloader | None = None,
+        extractor: ZipExtractor | None = None,
+        processor: CSVProcessor | None = None,
     ) -> None:
         self.crawler = crawler or SnapshotCrawler()
         self.downloader = downloader or FileDownloader(dest_dir=DOWNLOADS_DIR, workers=DOWNLOAD_WORKERS)
@@ -133,21 +132,21 @@ class CNPJPipeline:
 
     def run(
         self,
-        groups: Optional[list[str]] = None,
-        snapshot_date: Optional[str] = None,
+        groups: list[str] | None = None,
+        snapshot_date: str | None = None,
         force_download: bool = False,
         force_extract: bool = False,
         download_workers: int = TOTAL_DOWNLOAD_WORKERS,
         extract_workers: int = EXTRACT_WORKERS,
         process_workers: int = TOTAL_PROCESS_WORKERS,
         reference_only: bool = False,
-        snapshot: Optional["Snapshot"] = None,
+        snapshot: Snapshot | None = None,
         reuse_processed: bool = False,
-        skip_files: Optional[set[str]] = None,
+        skip_files: set[str] | None = None,
     ) -> PipelineRun:
         run = PipelineRun(
             snapshot_date=snapshot_date or "latest",
-            started_at=datetime.now(timezone.utc),
+            started_at=datetime.now(UTC),
         )
 
         self.downloader.workers = download_workers
@@ -196,7 +195,7 @@ class CNPJPipeline:
 
             if not files:
                 logger.warning("No files match the current filter — nothing to do")
-                run.finished_at = datetime.now(timezone.utc)
+                run.finished_at = datetime.now(UTC)
                 return run
 
             if reuse_processed and not (force_download or force_extract):
@@ -228,7 +227,7 @@ class CNPJPipeline:
 
             if not files:
                 logger.info("All selected files already have processed artifacts — skipping pipeline stages")
-                run.finished_at = datetime.now(timezone.utc)
+                run.finished_at = datetime.now(UTC)
                 return run
 
             logger.info("Processing {} files from snapshot {}", len(files), snapshot.date)
@@ -308,7 +307,7 @@ class CNPJPipeline:
 
         finally:
             session.close()
-            run.finished_at = datetime.now(timezone.utc)
+            run.finished_at = datetime.now(UTC)
             _save_run_report(run)
             _log_summary(run)
             structured_logger.info("=== PIPELINE END ===", operation="pipeline_complete")
@@ -317,17 +316,17 @@ class CNPJPipeline:
 
 
 def run_pipeline(
-    groups: Optional[list[str]] = None,
-    snapshot_date: Optional[str] = None,
+    groups: list[str] | None = None,
+    snapshot_date: str | None = None,
     force_download: bool = False,
     force_extract: bool = False,
     download_workers: int = TOTAL_DOWNLOAD_WORKERS,
     extract_workers: int = EXTRACT_WORKERS,
     process_workers: int = TOTAL_PROCESS_WORKERS,
     reference_only: bool = False,
-    snapshot: Optional["Snapshot"] = None,
+    snapshot: Snapshot | None = None,
     reuse_processed: bool = False,
-    skip_files: Optional[set[str]] = None,
+    skip_files: set[str] | None = None,
 ) -> PipelineRun:
     """Compatibilidade pública com a API funcional anterior."""
     return CNPJPipeline().run(

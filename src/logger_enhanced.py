@@ -14,7 +14,7 @@ import threading
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
 from loguru import logger as loguru_logger
 
@@ -62,7 +62,7 @@ class StructuredLogger:
             self._local.operation  = old_op
             self._local.correlation_id = old_cid
 
-    def _extra(self, **kwargs) -> Dict[str, Any]:
+    def _extra(self, **kwargs) -> dict[str, Any]:
         return {
             "correlation_id": self.get_correlation_id(),
             "operation":      self.get_operation(),

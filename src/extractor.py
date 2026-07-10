@@ -11,7 +11,6 @@ from __future__ import annotations
 import time
 import zipfile
 from pathlib import Path
-from typing import Optional
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -114,7 +113,7 @@ class ZipExtractor:
         self,
         download_results: list[DownloadResult],
         overwrite: bool = False,
-        workers: Optional[int] = None,
+        workers: int | None = None,
     ) -> list[ExtractionResult]:
         if not download_results:
             return []

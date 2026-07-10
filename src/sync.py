@@ -12,10 +12,10 @@ Orquestra:
 from __future__ import annotations
 
 import shutil
-import time
+from collections.abc import Iterator
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any
 
 import pandas as pd
 import pyarrow.parquet as pq
@@ -32,7 +32,7 @@ class DataFrameNormalizer:
     """Serviço de normalização aplicado antes da carga no banco."""
 
     @staticmethod
-    def _norm_date(val: Any) -> Optional[str]:
+    def _norm_date(val: Any) -> str | None:
         if val is None:
             return None
         try:
@@ -112,7 +112,7 @@ class ProcessedFileReader:
 
         raise ValueError(f"Formato de arquivo processado não suportado: {file_path.suffix}")
 
-    def read(self, file_path: Path, chunksize: Optional[int] = None):
+    def read(self, file_path: Path, chunksize: int | None = None):
         if chunksize:
             return self.iter_processed_chunks(file_path, chunksize)
 
@@ -141,10 +141,10 @@ class CNPJSync:
         db_connection: CNPJDatabase,
         data_dir: Path = Path("data"),
         chunk_size: int = CSV_CHUNK_ROWS,
-        pipeline: Optional[CNPJPipeline] = None,
-        snapshot_crawler: Optional[SnapshotCrawler] = None,
-        file_reader: Optional[ProcessedFileReader] = None,
-        normalizer: Optional[DataFrameNormalizer] = None,
+        pipeline: CNPJPipeline | None = None,
+        snapshot_crawler: SnapshotCrawler | None = None,
+        file_reader: ProcessedFileReader | None = None,
+        normalizer: DataFrameNormalizer | None = None,
     ):
         self.db = db_connection
         self.data_dir = data_dir
@@ -160,9 +160,9 @@ class CNPJSync:
         for d in (self.downloads_dir, self.extracted_dir, self.processed_dir):
             d.mkdir(parents=True, exist_ok=True)
 
-        self.current_exec_id: Optional[int] = None
-        self.current_snapshot_date: Optional[date] = None
-        self.file_tracking: Dict[str, int] = {}
+        self.current_exec_id: int | None = None
+        self.current_snapshot_date: date | None = None
+        self.file_tracking: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Inicialização do banco
@@ -193,7 +193,7 @@ class CNPJSync:
             return datetime.strptime(snapshot_label + "-01", "%Y-%m-%d").date()
         return datetime.strptime(snapshot_label, "%Y-%m-%d").date()
 
-    def check_snapshot_needs_sync(self, snapshot_date: date) -> Tuple[bool, str]:
+    def check_snapshot_needs_sync(self, snapshot_date: date) -> tuple[bool, str]:
         """
         Retorna (precisa_sincronizar, motivo).
         False = já processado com sucesso ou em andamento → pular.
@@ -221,7 +221,7 @@ class CNPJSync:
         self.file_tracking.clear()
         return True
 
-    def _register_file(self, remote_file: RemoteFile) -> Optional[int]:
+    def _register_file(self, remote_file: RemoteFile) -> int | None:
         if not self.current_exec_id:
             return None
         file_id = self.db.add_file_to_sync(
@@ -237,9 +237,9 @@ class CNPJSync:
         self,
         filename: str,
         status: str,
-        total: Optional[int] = None,
-        invalid: Optional[int] = None,
-        error: Optional[str] = None,
+        total: int | None = None,
+        invalid: int | None = None,
+        error: str | None = None,
     ) -> None:
         file_id = self.file_tracking.get(filename)
         if file_id:
@@ -249,7 +249,7 @@ class CNPJSync:
     # Processadores por grupo
     # ------------------------------------------------------------------
 
-    def _read_processed_file(self, file_path: Path, group: str, chunksize: Optional[int] = None):
+    def _read_processed_file(self, file_path: Path, group: str, chunksize: int | None = None):
         """
         Lê um arquivo processado pelo pipeline (CSV ou Parquet).
 
@@ -277,7 +277,7 @@ class CNPJSync:
             logger.error("Erro ao carregar {}: {}", group, e)
             raise
 
-    def _load_empresas(self, file_path: Path, snapshot_date: date) -> Tuple[int, int]:
+    def _load_empresas(self, file_path: Path, snapshot_date: date) -> tuple[int, int]:
         """Carrega empresas em chunks via bulk MERGE."""
         logger.debug("Carregando empresas: {}", file_path.name)
         total_inserted = total_updated = 0
@@ -299,7 +299,7 @@ class CNPJSync:
             logger.error("Erro ao carregar empresas: {}", e)
             raise
 
-    def _load_estabelecimentos(self, file_path: Path, snapshot_date: date) -> Tuple[int, int]:
+    def _load_estabelecimentos(self, file_path: Path, snapshot_date: date) -> tuple[int, int]:
         """Carrega estabelecimentos em chunks via bulk MERGE."""
         logger.debug("Carregando estabelecimentos: {}", file_path.name)
         total_inserted = total_updated = 0
@@ -342,7 +342,7 @@ class CNPJSync:
             logger.error("Erro ao carregar socios: {}", e)
             raise
 
-    def _load_simples(self, file_path: Path, snapshot_date: date) -> Tuple[int, int]:
+    def _load_simples(self, file_path: Path, snapshot_date: date) -> tuple[int, int]:
         """Carrega Simples Nacional em chunks via bulk MERGE."""
         logger.debug("Carregando simples: {}", file_path.name)
         total_inserted = total_updated = 0
@@ -377,21 +377,23 @@ class CNPJSync:
         """
         if group in self.REFERENCE_GROUPS:
             return self._load_reference(group, file_path, snapshot_date)
-        if group == "Empresas":
-            ins, upd = self._load_empresas(file_path, snapshot_date)
-            return ins + upd
-        if group == "Estabelecimentos":
-            ins, upd = self._load_estabelecimentos(file_path, snapshot_date)
-            return ins + upd
-        if group == "Socios":
-            return self._load_socios(file_path, snapshot_date)
-        if group == "Simples":
-            ins, upd = self._load_simples(file_path, snapshot_date)
-            return ins + upd
-        logger.warning("Grupo desconhecido ignorado: {}", group)
-        return 0
+        match group:
+            case "Empresas":
+                ins, upd = self._load_empresas(file_path, snapshot_date)
+                return ins + upd
+            case "Estabelecimentos":
+                ins, upd = self._load_estabelecimentos(file_path, snapshot_date)
+                return ins + upd
+            case "Socios":
+                return self._load_socios(file_path, snapshot_date)
+            case "Simples":
+                ins, upd = self._load_simples(file_path, snapshot_date)
+                return ins + upd
+            case _:
+                logger.warning("Grupo desconhecido ignorado: {}", group)
+                return 0
 
-    def _analyze_loaded_groups(self, groups: List[str]) -> None:
+    def _analyze_loaded_groups(self, groups: list[str]) -> None:
         try:
             self.db.analyze_groups(groups)
         except Exception as e:
@@ -403,8 +405,8 @@ class CNPJSync:
 
     def sync_snapshot(
         self,
-        snapshot_date: Optional[date] = None,
-        groups: Optional[List[str]] = None,
+        snapshot_date: date | None = None,
+        groups: list[str] | None = None,
         force_download: bool = False,
         force_extract: bool = False,
         download_workers: int = 4,
@@ -413,7 +415,7 @@ class CNPJSync:
         reference_only: bool = False,
         force: bool = False,
         reuse_processed: bool = False,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Sincroniza um snapshot completo.
 
@@ -641,7 +643,7 @@ class CNPJSync:
     # Status (observabilidade)
     # ------------------------------------------------------------------
 
-    def get_sync_status(self, exec_id: Optional[int] = None) -> Dict[str, Any]:
+    def get_sync_status(self, exec_id: int | None = None) -> dict[str, Any]:
         try:
             if exec_id is None:
                 rows = self.db.execute_query(
@@ -663,7 +665,7 @@ class CNPJSync:
                 return {"error": f"Execução {exec_id} não encontrada"}
 
             r = rows[0]
-            result: Dict[str, Any] = {
+            result: dict[str, Any] = {
                 "execution_id": r[0],
                 "snapshot_date": str(r[1]),
                 "status": r[2],

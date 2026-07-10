@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import abc
 from pathlib import Path
-from typing import Optional
 
 import pandas as pd
 import pyarrow as pa
@@ -55,7 +54,7 @@ class StorageWriter(abc.ABC):
         self._open()
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
         self._close()
         return False
 
@@ -101,7 +100,7 @@ class ParquetWriter(StorageWriter):
     as they arrive — no full-file accumulation in memory.
     """
 
-    _pq_writer: Optional[pq.ParquetWriter] = None
+    _pq_writer: pq.ParquetWriter | None = None
 
     def _open(self) -> None:
         if self.path.exists():
@@ -127,23 +126,23 @@ class ParquetWriter(StorageWriter):
 # Factory
 # ---------------------------------------------------------------------------
 
-def get_writer(backend: str, path: Path, group: str) -> "StorageWriter":
+def get_writer(backend: str, path: Path, group: str) -> StorageWriter:
     """Return a StorageWriter. Supports 'csv' and 'parquet'."""
-    backend_lower = backend.lower()
-    if backend_lower == "csv":
-        return CSVWriter(path, group)
-    elif backend_lower == "parquet":
-        return ParquetWriter(path, group)
-    else:
-        raise ValueError(f"Unknown storage backend '{backend}'. Supported: 'csv', 'parquet'.")
+    match backend.lower():
+        case "csv":
+            return CSVWriter(path, group)
+        case "parquet":
+            return ParquetWriter(path, group)
+        case _:
+            raise ValueError(f"Unknown storage backend '{backend}'. Supported: 'csv', 'parquet'.")
 
 
 def output_extension(backend: str) -> str:
     """Return the file extension for the given backend."""
-    backend_lower = backend.lower()
-    if backend_lower == "csv":
-        return ".csv"
-    elif backend_lower == "parquet":
-        return ".parquet"
-    else:
-        raise ValueError(f"Unknown storage backend '{backend}'.")
+    match backend.lower():
+        case "csv":
+            return ".csv"
+        case "parquet":
+            return ".parquet"
+        case _:
+            raise ValueError(f"Unknown storage backend '{backend}'.")

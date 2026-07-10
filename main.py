@@ -23,7 +23,6 @@ import shutil
 import sys
 import time
 from datetime import date, datetime
-from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -121,11 +120,11 @@ class CNPJSyncApplication:
         server: str = _DB_SERVER,
         port: int = _DB_PORT,
         database: str = _DB_DATABASE,
-        username: Optional[str] = _DB_USERNAME,
-        password: Optional[str] = _DB_PASSWORD,
+        username: str | None = _DB_USERNAME,
+        password: str | None = _DB_PASSWORD,
         log_level: str = _LOG_LEVEL,
         force: bool = _FORCE,
-        snapshot_date_raw: Optional[str] = _SNAPSHOT_DATE,
+        snapshot_date_raw: str | None = _SNAPSHOT_DATE,
         reuse_processed_env: bool = _REUSE_PROCESSED,
         download_workers: int = DOWNLOAD_WORKERS,
         extract_workers: int = EXTRACT_WORKERS,
@@ -160,7 +159,7 @@ class CNPJSyncApplication:
 
         return CNPJSync(db_connection=db)
 
-    def resolve_snapshot_date(self) -> Optional[date]:
+    def resolve_snapshot_date(self) -> date | None:
         if not self.snapshot_date_raw:
             return None
         return _parse_snapshot_date(self.snapshot_date_raw)

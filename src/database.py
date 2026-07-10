@@ -14,10 +14,11 @@ import io
 import os
 import re
 import uuid
+from collections.abc import Generator
 from contextlib import contextmanager, nullcontext
 from datetime import date
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional, Tuple
+from typing import Any
 
 import pandas as pd
 import psycopg2
@@ -25,7 +26,7 @@ import psycopg2.extensions
 from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from src.config import DB_CHUNK_ROWS
-from src.logger_enhanced import logger, structured_logger
+from src.logger_enhanced import logger
 
 _CHUNK_SIZE = DB_CHUNK_ROWS
 
@@ -46,12 +47,12 @@ class PostgreSQLConnection:
     def __init__(
         self,
         host: str = "localhost",
-        port: Optional[int] = None,
+        port: int | None = None,
         database: str = "postgres",
-        username: Optional[str] = None,
-        password: Optional[str] = None,
+        username: str | None = None,
+        password: str | None = None,
         schema: str = "cnpj",
-        database_url: Optional[str] = None,
+        database_url: str | None = None,
     ):
         self.host = host
         self.port = port or int(os.getenv("DB_PORT", "5432"))
@@ -103,7 +104,7 @@ class PostgreSQLConnection:
             logger.error("Falha no teste de conexão: {}", e)
             return False
 
-    def execute_query(self, query: str, params: tuple = ()) -> List[Tuple]:
+    def execute_query(self, query: str, params: tuple = ()) -> list[tuple]:
         query = query.replace("?", "%s")
         with self.connect() as conn:
             cur = conn.cursor()
@@ -128,11 +129,11 @@ class CNPJDatabase(PostgreSQLConnection):
     def __init__(
         self,
         database: str = "postgres",
-        server: Optional[str] = None,
+        server: str | None = None,
         host: str = "localhost",
-        port: Optional[int] = None,
-        username: Optional[str] = None,
-        password: Optional[str] = None,
+        port: int | None = None,
+        username: str | None = None,
+        password: str | None = None,
         **kwargs,
     ):
         # 'server' é aceito como alias de 'host' para compatibilidade com main.py
@@ -196,7 +197,7 @@ class CNPJDatabase(PostgreSQLConnection):
     @contextmanager
     def _cursor_scope(
         self,
-        conn: Optional[psycopg2.extensions.connection] = None,
+        conn: psycopg2.extensions.connection | None = None,
     ) -> Generator[psycopg2.extensions.cursor, None, None]:
         """
         Reuse an existing connection when provided, otherwise open a short-lived one.
@@ -212,7 +213,7 @@ class CNPJDatabase(PostgreSQLConnection):
                 cur.close()
 
     @staticmethod
-    def _valid_iso_date_str(value: Any) -> Optional[str]:
+    def _valid_iso_date_str(value: Any) -> str | None:
         if not isinstance(value, str) or len(value) != 10:
             return None
         try:
@@ -295,7 +296,7 @@ class CNPJDatabase(PostgreSQLConnection):
             logger.error("Erro ao verificar execução em andamento: {}", e)
             return False
 
-    def start_sync_session(self, snapshot_date: date, force: bool = False) -> Optional[int]:
+    def start_sync_session(self, snapshot_date: date, force: bool = False) -> int | None:
         snap_str = str(snapshot_date)
         try:
             with self.connect() as conn:
@@ -331,15 +332,15 @@ class CNPJDatabase(PostgreSQLConnection):
         self,
         exec_id: int,
         status: str,
-        total_files: Optional[int] = None,
-        processed_files: Optional[int] = None,
-        failed_files: Optional[int] = None,
-        total_records: Optional[int] = None,
-        error_message: Optional[str] = None,
+        total_files: int | None = None,
+        processed_files: int | None = None,
+        failed_files: int | None = None,
+        total_records: int | None = None,
+        error_message: str | None = None,
     ) -> bool:
         try:
             sets = ["status = %s"]
-            params: List[Any] = [status]
+            params: list[Any] = [status]
 
             if total_files is not None:
                 sets.append("total_arquivos = %s"); params.append(total_files)
@@ -374,7 +375,7 @@ class CNPJDatabase(PostgreSQLConnection):
 
     def add_file_to_sync(
         self, exec_id: int, group: str, filename: str, status: str = "PENDENTE"
-    ) -> Optional[int]:
+    ) -> int | None:
         try:
             with self.connect() as conn:
                 cur = conn.cursor()
@@ -394,13 +395,13 @@ class CNPJDatabase(PostgreSQLConnection):
         self,
         file_id: int,
         status: str,
-        total_records: Optional[int] = None,
-        invalid_records: Optional[int] = None,
-        error_message: Optional[str] = None,
+        total_records: int | None = None,
+        invalid_records: int | None = None,
+        error_message: str | None = None,
     ) -> bool:
         try:
             sets = ["status = %s", "data_fim = NOW()"]
-            params: List[Any] = [status]
+            params: list[Any] = [status]
             if total_records is not None:
                 sets.append("total_registros = %s"); params.append(total_records)
             if invalid_records is not None:
@@ -440,9 +441,9 @@ class CNPJDatabase(PostgreSQLConnection):
         filename: str,
         group: str,
         status: str,
-        size_bytes: Optional[int] = None,
-        local_path: Optional[str] = None,
-        error: Optional[str] = None,
+        size_bytes: int | None = None,
+        local_path: str | None = None,
+        error: str | None = None,
     ) -> bool:
         """Grava ou atualiza o status de download de um arquivo (upsert por snapshot+nome)."""
         try:
@@ -490,7 +491,7 @@ class CNPJDatabase(PostgreSQLConnection):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _nullify_empty(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    def _nullify_empty(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
         """Converte strings vazias e NaN para None nas colunas especificadas."""
         for col in cols:
             if col in df.columns:
@@ -518,7 +519,7 @@ class CNPJDatabase(PostgreSQLConnection):
         table: str,
         df: pd.DataFrame,
         snapshot_date: date,
-        conn: Optional[psycopg2.extensions.connection] = None,
+        conn: psycopg2.extensions.connection | None = None,
     ) -> int:
         if df.empty:
             return 0
@@ -579,8 +580,8 @@ class CNPJDatabase(PostgreSQLConnection):
         self,
         df: pd.DataFrame,
         snapshot_date: date,
-        conn: Optional[psycopg2.extensions.connection] = None,
-    ) -> Tuple[int, int]:
+        conn: psycopg2.extensions.connection | None = None,
+    ) -> tuple[int, int]:
         if df.empty:
             return 0, 0
 
@@ -718,8 +719,8 @@ class CNPJDatabase(PostgreSQLConnection):
         self,
         df: pd.DataFrame,
         snapshot_date: date,
-        conn: Optional[psycopg2.extensions.connection] = None,
-    ) -> Tuple[int, int]:
+        conn: psycopg2.extensions.connection | None = None,
+    ) -> tuple[int, int]:
         if df.empty:
             return 0, 0
 
@@ -842,8 +843,8 @@ class CNPJDatabase(PostgreSQLConnection):
         self,
         df: pd.DataFrame,
         snapshot_date: date,
-        conn: Optional[psycopg2.extensions.connection] = None,
-    ) -> Tuple[int, int]:
+        conn: psycopg2.extensions.connection | None = None,
+    ) -> tuple[int, int]:
         if df.empty:
             return 0, 0
 
@@ -929,7 +930,7 @@ class CNPJDatabase(PostgreSQLConnection):
         self,
         df: pd.DataFrame,
         snapshot_date: date,
-        conn: Optional[psycopg2.extensions.connection] = None,
+        conn: psycopg2.extensions.connection | None = None,
     ) -> int:
         if df.empty:
             return 0
@@ -1052,7 +1053,7 @@ class CNPJDatabase(PostgreSQLConnection):
                     logger.error("Erro no bulk_insert_socios: {}", e)
                     raise
 
-    def analyze_groups(self, groups: List[str]) -> None:
+    def analyze_groups(self, groups: list[str]) -> None:
         group_to_table = {
             "Cnaes": "cnaes",
             "Motivos": "motivos",
@@ -1080,7 +1081,7 @@ class CNPJDatabase(PostgreSQLConnection):
     # Informações do banco
     # ------------------------------------------------------------------
 
-    def get_database_info(self) -> Dict[str, Any]:
+    def get_database_info(self) -> dict[str, Any]:
         try:
             rows = self.execute_query("SELECT current_database(), version()")
             tables = self.execute_query(

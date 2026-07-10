@@ -14,7 +14,6 @@ from __future__ import annotations
 import re
 import xml.etree.ElementTree as ET
 from datetime import datetime
-from typing import Optional
 from urllib.parse import unquote
 
 import requests
@@ -44,7 +43,7 @@ _SIZE_MAP = {"K": 1_024, "M": 1_024**2, "G": 1_024**3}
 # Helpers compartilhados
 # ---------------------------------------------------------------------------
 
-def _group_and_partition(filename: str) -> tuple[str, Optional[int]]:
+def _group_and_partition(filename: str) -> tuple[str, int | None]:
     """
     Extrai grupo lógico e índice de partição do nome do arquivo.
     'Empresas3.zip' → ('Empresas', 3)
@@ -59,7 +58,7 @@ def _group_and_partition(filename: str) -> tuple[str, Optional[int]]:
     return stem, None
 
 
-def _parse_size(raw: str) -> Optional[int]:
+def _parse_size(raw: str) -> int | None:
     """Converte '486M' → bytes."""
     raw = raw.strip()
     if not raw or raw == "-":
@@ -70,7 +69,7 @@ def _parse_size(raw: str) -> Optional[int]:
     return int(float(m.group(1)) * _SIZE_MAP.get(m.group(2).upper(), 1))
 
 
-def _parse_date(raw: str) -> Optional[datetime]:
+def _parse_date(raw: str) -> datetime | None:
     for fmt in ("%a, %d %b %Y %H:%M:%S %Z", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M"):
         try:
             return datetime.strptime(raw.strip(), fmt)
@@ -79,7 +78,7 @@ def _parse_date(raw: str) -> Optional[datetime]:
     return None
 
 
-def _select_snapshot_dir(available_dirs: list[str], requested: Optional[str] = None) -> str:
+def _select_snapshot_dir(available_dirs: list[str], requested: str | None = None) -> str:
     """Pick the latest snapshot, or resolve a requested month/day to a concrete folder."""
     if not available_dirs:
         raise RuntimeError("Nenhuma pasta de snapshot encontrada")
@@ -135,7 +134,8 @@ def _webdav_snapshot_dirs(session: requests.Session) -> list[str]:
     folders: list[str] = []
 
     for resp in root.findall("d:response", _DAV_NS):
-        href = resp.find("d:href", _DAV_NS).text or ""
+        href_el = resp.find("d:href", _DAV_NS)
+        href = (href_el.text if href_el is not None else None) or ""
         nome = unquote(href.rstrip("/").split("/")[-1])
         if _YYYY_MM.match(nome) or _YYYY_MM_DD.match(nome):
             folders.append(nome)
@@ -154,15 +154,16 @@ def _list_files_webdav(pasta: str, session: requests.Session) -> list[RemoteFile
     files: list[RemoteFile] = []
 
     for resp in root.findall("d:response", _DAV_NS):
-        href = resp.find("d:href", _DAV_NS).text or ""
+        href_el = resp.find("d:href", _DAV_NS)
+        href = (href_el.text if href_el is not None else None) or ""
         nome = unquote(href.rstrip("/").split("/")[-1])
 
         if not nome.endswith(".zip"):
             continue
 
         props = resp.find(".//d:prop", _DAV_NS)
-        size_bytes: Optional[int] = None
-        last_modified: Optional[datetime] = None
+        size_bytes: int | None = None
+        last_modified: datetime | None = None
 
         if props is not None:
             size_el = props.find("d:getcontentlength", _DAV_NS)
@@ -190,7 +191,7 @@ def _list_files_webdav(pasta: str, session: requests.Session) -> list[RemoteFile
     return sorted(files, key=lambda f: f.name)
 
 
-def _discover_webdav(session: requests.Session, requested_snapshot: Optional[str] = None) -> Snapshot:
+def _discover_webdav(session: requests.Session, requested_snapshot: str | None = None) -> Snapshot:
     """Descobre um snapshot específico ou o mais recente via WebDAV."""
     session.auth = RF_AUTH
 
@@ -280,7 +281,7 @@ def _parse_snapshot_listing_html(html: str, snapshot_url: str) -> list[RemoteFil
 def _discover_html(
     session: requests.Session,
     base_url: str,
-    requested_snapshot: Optional[str] = None,
+    requested_snapshot: str | None = None,
 ) -> Snapshot:
     """Descobre um snapshot específico ou o mais recente via listagem HTML."""
     logger.debug("Buscando índice HTML: {}", base_url)
@@ -320,7 +321,7 @@ class SnapshotCrawler:
     def __init__(
         self,
         fallback_base_url: str = FALLBACK_BASE_URL,
-        default_headers: Optional[dict[str, str]] = None,
+        default_headers: dict[str, str] | None = None,
         rf_auth: tuple[str, str] = RF_AUTH,
     ) -> None:
         self.fallback_base_url = fallback_base_url
@@ -370,7 +371,7 @@ class SnapshotCrawler:
 
     def discover_latest_snapshot_with_fallback(
         self,
-        session: Optional[requests.Session] = None,
+        session: requests.Session | None = None,
     ) -> Snapshot:
         own_session = session is None
         if own_session:
@@ -389,7 +390,7 @@ class SnapshotCrawler:
     def discover_snapshot_with_fallback(
         self,
         snapshot_ref: str,
-        session: Optional[requests.Session] = None,
+        session: requests.Session | None = None,
     ) -> Snapshot:
         own_session = session is None
         if own_session:
@@ -411,7 +412,7 @@ class SnapshotCrawler:
 
 
 def discover_latest_snapshot_with_fallback(
-    session: Optional[requests.Session] = None,
+    session: requests.Session | None = None,
 ) -> Snapshot:
     """
     Tenta a fonte primária (WebDAV RF), cai no fallback (HTML casadosdados) se falhar.
@@ -421,7 +422,7 @@ def discover_latest_snapshot_with_fallback(
 
 def discover_snapshot_with_fallback(
     snapshot_ref: str,
-    session: Optional[requests.Session] = None,
+    session: requests.Session | None = None,
 ) -> Snapshot:
     """Resolve um snapshot específico com fallback da fonte primária para a secundária."""
     return SnapshotCrawler().discover_snapshot_with_fallback(snapshot_ref, session=session)

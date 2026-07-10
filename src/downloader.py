@@ -17,7 +17,6 @@ import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Optional
 
 import requests
 from tenacity import (
@@ -48,7 +47,7 @@ def _local_path(remote_file: RemoteFile, base_dir: Path = DOWNLOADS_DIR) -> Path
     return base_dir / remote_file.name
 
 
-def _already_complete(path: Path, expected_bytes: Optional[int]) -> bool:
+def _already_complete(path: Path, expected_bytes: int | None) -> bool:
     """
     Return True if the local file exists and its size matches the expected size.
     Tolerates ±5% to account for rounded directory-listing sizes.
@@ -161,7 +160,7 @@ class FileDownloader:
         self,
         dest_dir: Path = DOWNLOADS_DIR,
         workers: int = TOTAL_DOWNLOAD_WORKERS,
-        default_headers: Optional[dict[str, str]] = None,
+        default_headers: dict[str, str] | None = None,
         rf_auth: tuple[str, str] = RF_AUTH,
     ) -> None:
         self.dest_dir = dest_dir
@@ -178,7 +177,7 @@ class FileDownloader:
     def download_file(
         self,
         remote_file: RemoteFile,
-        session: Optional[requests.Session] = None,
+        session: requests.Session | None = None,
         force: bool = False,
     ) -> DownloadResult:
         dest = _local_path(remote_file, self.dest_dir)
@@ -265,7 +264,7 @@ class FileDownloader:
         self,
         files: list[RemoteFile],
         force: bool = False,
-        workers: Optional[int] = None,
+        workers: int | None = None,
     ) -> list[DownloadResult]:
         if not files:
             return []
@@ -308,7 +307,7 @@ class FileDownloader:
 
 def download_file(
     remote_file: RemoteFile,
-    session: Optional[requests.Session] = None,
+    session: requests.Session | None = None,
     dest_dir: Path = DOWNLOADS_DIR,
     force: bool = False,
 ) -> DownloadResult:

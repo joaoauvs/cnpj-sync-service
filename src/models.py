@@ -8,12 +8,11 @@ pipeline artefacts so they can be serialised/deserialised cleanly.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import Optional
 
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field
 
 
 class FileStatus(str, Enum):
@@ -31,12 +30,12 @@ class FileStatus(str, Enum):
 class RemoteFile(BaseModel):
     """Represents a single ZIP file discovered on the remote index."""
 
-    name: str                  # e.g. "Empresas0.zip"
-    url: str                   # full URL
-    group: str                 # e.g. "Empresas"
-    partition: Optional[int]   # numeric suffix from filename (e.g. 0, 1, 10…); None for non-partitioned files
-    size_bytes: Optional[int]  # None if server didn't report size
-    last_modified: Optional[datetime]
+    name: str                # e.g. "Empresas0.zip"
+    url: str                 # full URL
+    group: str               # e.g. "Empresas"
+    partition: int | None    # numeric suffix from filename (e.g. 0, 1, 10…); None for non-partitioned files
+    size_bytes: int | None   # None if server didn't report size
+    last_modified: datetime | None
 
     @property
     def stem(self) -> str:
@@ -63,7 +62,7 @@ class DownloadResult(BaseModel):
     local_path: Path
     status: FileStatus
     bytes_downloaded: int = 0
-    error: Optional[str] = None
+    error: str | None = None
     duration_seconds: float = 0.0
 
 
@@ -73,7 +72,7 @@ class ExtractionResult(BaseModel):
     download_result: DownloadResult
     extracted_paths: list[Path] = Field(default_factory=list)
     status: FileStatus
-    error: Optional[str] = None
+    error: str | None = None
     duration_seconds: float = 0.0
 
 
@@ -81,11 +80,11 @@ class ProcessingResult(BaseModel):
     """Outcome of processing a CSV into a structured output."""
 
     extraction_result: ExtractionResult
-    output_path: Optional[Path] = None
+    output_path: Path | None = None
     rows_written: int = 0
     rows_invalid: int = 0
     status: FileStatus
-    error: Optional[str] = None
+    error: str | None = None
     duration_seconds: float = 0.0
 
 
@@ -93,8 +92,8 @@ class PipelineRun(BaseModel):
     """Top-level summary of a full pipeline execution."""
 
     snapshot_date: str
-    started_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    finished_at: Optional[datetime] = None
+    started_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    finished_at: datetime | None = None
     results: list[ProcessingResult] = Field(default_factory=list)
 
     @property

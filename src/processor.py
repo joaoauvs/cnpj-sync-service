@@ -16,7 +16,6 @@ from __future__ import annotations
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Optional
 
 import pandas as pd
 
@@ -33,7 +32,7 @@ from src.config import (
 )
 from src.logger_enhanced import logger
 from src.models import ExtractionResult, FileStatus, ProcessingResult
-from src.storage import get_writer
+from src.storage import get_writer, output_extension
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -67,7 +66,7 @@ def _normalise_decimal_column(series: pd.Series) -> pd.Series:
     )
 
 
-def _detect_group(csv_path: Path) -> Optional[str]:
+def _detect_group(csv_path: Path) -> str | None:
     """
     Infer the data group (e.g. 'Empresas') from the CSV file name.
 
@@ -158,8 +157,6 @@ class CSVProcessor:
         decimal_cols = DECIMAL_COLUMNS.get(group, [])
 
         zip_stem = extraction_result.download_result.remote_file.stem
-        from src.storage import output_extension
-
         ext = output_extension(self.storage_backend)
         output_path = self.output_dir / f"{zip_stem}{ext}"
         reject_path = self.output_dir / f"{zip_stem}_rejects.csv"
@@ -274,7 +271,7 @@ class CSVProcessor:
     def process_all(
         self,
         extraction_results: list[ExtractionResult],
-        workers: Optional[int] = None,
+        workers: int | None = None,
     ) -> list[ProcessingResult]:
         if not extraction_results:
             return []
